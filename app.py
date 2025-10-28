@@ -1,4 +1,3 @@
-import asyncio
 import streamlit as st
 from grader_langgraph import build_grader_graph, feedback
 
@@ -16,8 +15,11 @@ else:
     source_code = code_input
 
 st.markdown("### 🧩 Test Cases")
-test_input = st.text_area("Enter test cases (input => expected_output):",
-                          "2 3 => 5\n10 20 => 30", height=100)
+test_input = st.text_area(
+    "Enter test cases (input => expected_output):",
+    "2 3 => 5\n10 20 => 30",
+    height=100
+)
 
 tests = []
 for line in test_input.strip().splitlines():
@@ -31,9 +33,9 @@ if st.button("🚀 Run Autograder"):
     else:
         st.info("Running evaluation... Please wait ⏳")
 
-        async def run_graph():
+        def run_graph():
             g = build_grader_graph()
-            inputs = {}  # state starts empty
+            inputs = {}
             config = {
                 "configurable": {
                     "submission_id": "user1",
@@ -41,16 +43,13 @@ if st.button("🚀 Run Autograder"):
                     "tests": tests
                 }
             }
-            # ✅ explicitly pass config so nodes get it
-            result = await g.ainvoke(inputs, config=config)
+            # ✅ synchronous invoke, no async issues
+            result = g.invoke(inputs, config=config)
             return result
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        result = loop.run_until_complete(run_graph())
-        loop.close()
-
+        result = run_graph()
         fb = feedback(result)
+
         st.success("✅ Evaluation completed successfully!")
 
         st.subheader("📊 Evaluation Report")
