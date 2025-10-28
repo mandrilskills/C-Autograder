@@ -8,15 +8,18 @@ import os
 
 # === Utility: wrap async → sync for LangGraph ===
 def make_sync(agent):
-    """Wrap async agent in sync for compatibility (works with Streamlit Cloud and Windows)."""
     def wrapper(state, config):
-        try:
-            loop = asyncio.get_running_loop()
-            if loop.is_running():
-                return loop.run_until_complete(agent(state, config))
-        except RuntimeError:
-            pass
-        return asyncio.run(agent(state, config))
+        result = agent(state, config)
+        if asyncio.iscoroutine(result):
+            try:
+                loop = asyncio.get_running_loop()
+                if loop.is_running():
+                    return loop.run_until_complete(result)
+            except RuntimeError:
+                pass
+            return asyncio.run(result)
+        else:
+            return result
     return wrapper
 
 # === Setup ===
@@ -33,9 +36,7 @@ class GraderState(TypedDict, total=False):
 
 # === Cross-platform subprocess helper ===
 async def run_subprocess(cmd, input_data=None, timeout=None, cwd=None):
-    """Runs subprocess safely with support for Windows and Linux."""
     loop = asyncio.get_event_loop()
-
     def _run():
         return subprocess.run(
             cmd,
@@ -155,7 +156,6 @@ def orchestrate(state: GraderState, config: Dict[str, Any]):
         total += w * state.get(k, {}).get("score", 0)
     return {"final": {"score": total}}
 
-# === Feedback ===
 def feedback(result: GraderState):
     compile_res = result.get("compile", {})
     test_res = result.get("test", {})
@@ -165,7 +165,6 @@ def feedback(result: GraderState):
 
     fb = {"final_score": round(final_res.get("score", 0) * 100, 2), "sections": []}
 
-    # Compilation
     fb["sections"].append({
         "section": "Compilation",
         "score": round(compile_res.get("score", 0) * 100, 1),
@@ -215,7 +214,6 @@ def feedback(result: GraderState):
 
     return fb
 
-# === Build LangGraph ===
 def build_grader_graph():
     g = StateGraph(GraderState)
     g.add_node("compile", make_sync(compile_agent))
