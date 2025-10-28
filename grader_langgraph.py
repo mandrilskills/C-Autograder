@@ -6,9 +6,11 @@ from pathlib import Path
 from typing import TypedDict, Dict, Any, Optional
 from langgraph.graph import StateGraph, END
 
+
 # ====== Setup ======
-WORK_DIR = Path("runs")
+WORK_DIR = Path("/tmp")  # ✅ use /tmp for Streamlit Cloud
 WORK_DIR.mkdir(exist_ok=True)
+
 
 # ====== Define State Schema ======
 class GraderState(TypedDict, total=False):
@@ -17,9 +19,10 @@ class GraderState(TypedDict, total=False):
     perf: dict
     final: dict
 
-# ====== Safe subprocess helper (supports cwd) ======
+
+# ====== Safe subprocess helper ======
 async def run_subprocess(cmd, input_data: Optional[str] = None, timeout: Optional[int] = 3, cwd: Optional[str] = None):
-    """Run a subprocess asynchronously with optional stdin input and timeout."""
+    """Run subprocess safely with timeout and optional working dir"""
     loop = asyncio.get_event_loop()
 
     def _run():
@@ -38,47 +41,49 @@ async def run_subprocess(cmd, input_data: Optional[str] = None, timeout: Optiona
 
     return await loop.run_in_executor(None, _run)
 
-# ====== Agents (all accept config=None) ======
+
+# ====== Agents ======
 async def compile_agent(state: GraderState, config: Dict[str, Any] = None):
-    """Compile the uploaded C source file with full path awareness."""
+    """Compile the uploaded C source file using absolute safe paths (Streamlit Cloud compatible)."""
+    import os
     configurable = (config or {}).get("configurable", {})
     submission_id = configurable.get("submission_id", f"run_{uuid.uuid4().hex[:6]}")
     source_code = configurable.get("source_code", "")
 
-    # Create unique subfolder
-    run_dir = WORK_DIR / f"{submission_id}_{uuid.uuid4().hex[:8]}"
-    run_dir.mkdir(exist_ok=True)
+    # ✅ Use /tmp instead of local runs/
+    base_dir = WORK_DIR / f"{submission_id}_{uuid.uuid4().hex[:8]}"
+    base_dir.mkdir(parents=True, exist_ok=True)
 
-    src = run_dir / "main.c"
+    src = base_dir / "main.c"
+    exe = base_dir / "a.out"
     src.write_text(source_code)
-    exe = run_dir / "a.out"
 
-    # Safety check
-    if not src.exists():
+    # Debug: confirm the file actually exists
+    if not src.exists() or os.path.getsize(src) == 0:
         return {
             "compile": {
                 "success": False,
-                "stderr": "❌ Source file not found.",
+                "stderr": "❌ Uploaded file is empty or missing after write.",
                 "stdout": "",
-                "run_dir": str(run_dir),
+                "run_dir": str(base_dir),
                 "exe": str(exe),
                 "score": 0.0,
             }
         }
 
-    # ✅ Use full absolute path instead of cwd-relative name
+    # ✅ Use full absolute paths for gcc
     cmd = ["gcc", "-std=c11", str(src), "-o", str(exe), "-Wall", "-Wextra"]
-    proc = await run_subprocess(cmd, timeout=10)  # remove cwd argument
 
+    proc = await run_subprocess(cmd, timeout=10)
     success = proc.returncode == 0
     stderr_text = proc.stderr.strip()
 
-    # Friendly message for missing main
+    # If gcc compiled nothing
     if "undefined reference to `main'" in stderr_text or "undefined reference to `main`" in stderr_text:
         stderr_text = (
-            "❌ Linker error: no `main()` found.\n"
-            "This can occur if the compiler didn't read your file correctly. "
-            "Please ensure the uploaded file isn't empty or malformed."
+            f"❌ Linker error: no main() found.\n"
+            f"GCC tried to compile: {src}\n"
+            f"But it didn’t detect a valid main() function. Check for hidden characters or CRLF line endings."
         )
 
     return {
@@ -86,7 +91,7 @@ async def compile_agent(state: GraderState, config: Dict[str, Any] = None):
             "success": success,
             "stderr": stderr_text,
             "stdout": proc.stdout,
-            "run_dir": str(run_dir),
+            "run_dir": str(base_dir),
             "exe": str(exe),
             "score": 1.0 if success else 0.0,
         }
@@ -95,7 +100,6 @@ async def compile_agent(state: GraderState, config: Dict[str, Any] = None):
 
 async def static_agent(state: GraderState, config: Dict[str, Any] = None):
     """Run cppcheck static analysis."""
-    # If compile not present or failed, return skipped
     if not state.get("compile", {}).get("success"):
         return {"static": {"success": False, "score": 0.0, "issues": ["Skipped due to compile failure."]}}
 
@@ -120,6 +124,7 @@ async def static_agent(state: GraderState, config: Dict[str, Any] = None):
     score = max(0.0, 1.0 - 0.05 * len(issues))
     return {"static": {"success": True, "score": score, "issues": issues}}
 
+
 async def performance_agent(state: GraderState, config: Dict[str, Any] = None):
     """Measure runtime for a short sample input (prevents hangs with timeout)."""
     if not state.get("compile", {}).get("success"):
@@ -134,12 +139,13 @@ async def performance_agent(state: GraderState, config: Dict[str, Any] = None):
     times = []
     for _ in range(3):
         start = time.perf_counter()
-        proc = await run_subprocess(["./a.out"], input_data=sample_input, timeout=3, cwd=str(run_dir))
+        proc = await run_subprocess([str(exe_path)], input_data=sample_input, timeout=3)
         elapsed = time.perf_counter() - start
         times.append(elapsed)
     avg = sum(times) / len(times) if times else 0.0
     score = 1.0 if avg < 0.1 else (0.7 if avg < 1.0 else 0.3)
     return {"perf": {"success": True, "score": score, "avg_time": avg}}
+
 
 def orchestrate(state: GraderState, config: Dict[str, Any] = None):
     """Combine results into final weighted score."""
@@ -150,6 +156,7 @@ def orchestrate(state: GraderState, config: Dict[str, Any] = None):
     for k, w in weights.items():
         total += w * state.get(k, {}).get("score", 0.0)
     return {"final": {"score": total}}
+
 
 # ====== Feedback formatter ======
 def feedback(result: GraderState):
@@ -164,7 +171,8 @@ def feedback(result: GraderState):
     fb["sections"].append({
         "section": "Compilation",
         "score": round(compile_res.get("score", 0.0) * 100, 1),
-        "text": "✅ Compiled successfully." if compile_res.get("success") else f"❌ Compilation failed:\n\n{compile_res.get('stderr', '').strip()}"
+        "text": "✅ Compiled successfully." if compile_res.get("success")
+        else f"❌ Compilation failed:\n\n{compile_res.get('stderr', '').strip()}"
     })
 
     # Static
@@ -204,15 +212,14 @@ def feedback(result: GraderState):
     )
     return fb
 
+
 # ====== Graph builder ======
 def build_grader_graph():
     g = StateGraph(GraderState)
-
     g.add_node("compile", compile_agent)
     g.add_node("static", static_agent)
     g.add_node("perf", performance_agent)
     g.add_node("orchestrate", orchestrate)
-
     g.set_entry_point("compile")
 
     def after_compile(state: GraderState):
@@ -224,6 +231,4 @@ def build_grader_graph():
     g.add_edge("static", "perf")
     g.add_edge("perf", "orchestrate")
     g.add_edge("orchestrate", END)
-
     return g.compile()
-
