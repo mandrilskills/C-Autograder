@@ -4,11 +4,12 @@ from pathlib import Path
 from typing import TypedDict, Dict, Any
 from langgraph.graph import StateGraph, END
 import asyncio
+import os
 
 
-# === Utility: make async agents sync for LangGraph ===
+# === Utility: wrap async → sync for LangGraph ===
 def make_sync(agent):
-    """Wrap async function into sync callable for LangGraph compatibility (Python 3.13 safe)."""
+    """Wrap async agent in sync for compatibility (works with Streamlit Cloud and Windows)."""
     def wrapper(state, config):
         return asyncio.run(agent(state, config))
     return wrapper
@@ -28,8 +29,9 @@ class GraderState(TypedDict, total=False):
     final: dict
 
 
-# === Safe subprocess ===
+# === Cross-platform subprocess helper ===
 async def run_subprocess(cmd, input_data=None, timeout=None, cwd=None):
+    """Runs subprocess safely with support for Windows and Linux."""
     loop = asyncio.get_event_loop()
 
     def _run():
@@ -56,9 +58,10 @@ async def compile_agent(state: GraderState, config: Dict[str, Any]):
     run_dir.mkdir(exist_ok=True)
     src = run_dir / "main.c"
     src.write_text(source_code)
-    exe = run_dir / "a.out"
 
-    cmd = ["gcc", "-std=c11", "main.c", "-o", "a.out", "-Wall", "-Wextra"]
+    exe_name = "a.out.exe" if os.name == "nt" else "a.out"
+    cmd = ["gcc", "-std=c11", "main.c", "-o", exe_name, "-Wall", "-Wextra"]
+
     proc = await run_subprocess(cmd, cwd=str(run_dir))
 
     success = proc.returncode == 0
@@ -68,6 +71,7 @@ async def compile_agent(state: GraderState, config: Dict[str, Any]):
             "stderr": proc.stderr,
             "stdout": proc.stdout,
             "run_dir": str(run_dir),
+            "exe_name": exe_name,
             "score": 1.0 if success else 0.0
         }
     }
@@ -75,7 +79,6 @@ async def compile_agent(state: GraderState, config: Dict[str, Any]):
 
 async def static_agent(state: GraderState, config: Dict[str, Any]):
     run_dir = Path(state["compile"]["run_dir"])
-    src = run_dir / "main.c"
     issues = []
     try:
         cpp = subprocess.run(
@@ -99,20 +102,27 @@ async def static_agent(state: GraderState, config: Dict[str, Any]):
 async def test_agent(state: GraderState, config: Dict[str, Any]):
     configurable = config.get("configurable", {})
     tests = configurable.get("tests", [])
-
     run_dir = Path(state["compile"]["run_dir"])
-    exe = run_dir / "a.out"
-    if not exe.exists():
+
+    exe_path = Path(run_dir) / state["compile"]["exe_name"]
+    if not exe_path.exists():
         return {"test": {"success": False, "score": 0, "results": []}}
+
+    # ✅ Cross-platform execution command
+    exec_cmd = [str(exe_path)] if os.name == "nt" else ["./" + exe_path.name]
 
     results = []
     passed = 0
-
     for t in tests:
-        proc = await run_subprocess(["./a.out"], input_data=t["input"], cwd=str(run_dir))
+        proc = await run_subprocess(exec_cmd, input_data=t["input"], cwd=str(run_dir))
         out = proc.stdout.strip()
         ok = out == t["output"].strip()
-        results.append({"input": t["input"], "expected": t["output"], "output": out, "passed": ok})
+        results.append({
+            "input": t["input"],
+            "expected": t["output"],
+            "output": out,
+            "passed": ok
+        })
         if ok:
             passed += 1
 
@@ -124,16 +134,18 @@ async def test_agent(state: GraderState, config: Dict[str, Any]):
 
 async def performance_agent(state: GraderState, config: Dict[str, Any]):
     run_dir = Path(state["compile"]["run_dir"])
-    exe = run_dir / "a.out"
-    if not exe.exists():
+    exe_path = Path(run_dir) / state["compile"]["exe_name"]
+
+    if not exe_path.exists():
         return {"perf": {"success": False, "score": 0, "avg_time": 0}}
+
+    exec_cmd = [str(exe_path)] if os.name == "nt" else ["./" + exe_path.name]
 
     sample_input = "2 3"
     times = []
-
     for _ in range(3):
         start = time.perf_counter()
-        await run_subprocess(["./a.out"], input_data=sample_input, cwd=str(run_dir))
+        await run_subprocess(exec_cmd, input_data=sample_input, cwd=str(run_dir))
         times.append(time.perf_counter() - start)
 
     avg = sum(times) / len(times)
@@ -160,15 +172,13 @@ def feedback(result: GraderState):
     fb = {"final_score": round(final_res.get("score", 0) * 100, 2), "sections": []}
 
     # Compilation
-    if compile_res:
-        fb["sections"].append({
-            "section": "Compilation",
-            "score": round(compile_res.get("score", 0) * 100, 1),
-            "text": "✅ Compiled successfully." if compile_res.get("success")
-            else f"❌ Compilation failed:\n\n{compile_res.get('stderr', 'Unknown error')}"
-        })
+    fb["sections"].append({
+        "section": "Compilation",
+        "score": round(compile_res.get("score", 0) * 100, 1),
+        "text": "✅ Compiled successfully." if compile_res.get("success")
+        else f"❌ Compilation failed:\n\n{compile_res.get('stderr', 'Unknown error')}"
+    })
 
-    # Only proceed if compiled
     if compile_res.get("success"):
         if test_res:
             test_text = "\n".join(
@@ -212,10 +222,9 @@ def feedback(result: GraderState):
     return fb
 
 
-# === Graph Builder ===
+# === Build LangGraph ===
 def build_grader_graph():
     g = StateGraph(GraderState)
-
     g.add_node("compile", make_sync(compile_agent))
     g.add_node("static", make_sync(static_agent))
     g.add_node("test", make_sync(test_agent))
@@ -228,5 +237,4 @@ def build_grader_graph():
     g.add_edge("test", "perf")
     g.add_edge("perf", "orchestrate")
     g.add_edge("orchestrate", END)
-
     return g.compile()
