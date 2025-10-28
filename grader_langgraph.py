@@ -1,16 +1,25 @@
-import asyncio
 import subprocess
 import time
 from pathlib import Path
 from typing import TypedDict, Dict, Any
-
 from langgraph.graph import StateGraph, END
+import asyncio
 
-# ====== Setup ======
+
+# === Utility: make async agents sync for LangGraph ===
+def make_sync(agent):
+    """Wrap async function into sync callable for LangGraph compatibility (Python 3.13 safe)."""
+    def wrapper(state, config):
+        return asyncio.run(agent(state, config))
+    return wrapper
+
+
+# === Setup ===
 WORK_DIR = Path("runs")
 WORK_DIR.mkdir(exist_ok=True)
 
-# ====== Define State Schema ======
+
+# === Define State Schema ===
 class GraderState(TypedDict, total=False):
     compile: dict
     static: dict
@@ -18,7 +27,8 @@ class GraderState(TypedDict, total=False):
     perf: dict
     final: dict
 
-# ====== Windows + Cloud Safe Subprocess ======
+
+# === Safe subprocess ===
 async def run_subprocess(cmd, input_data=None, timeout=None, cwd=None):
     loop = asyncio.get_event_loop()
 
@@ -35,7 +45,8 @@ async def run_subprocess(cmd, input_data=None, timeout=None, cwd=None):
 
     return await loop.run_in_executor(None, _run)
 
-# ====== Agents ======
+
+# === Agents ===
 async def compile_agent(state: GraderState, config: Dict[str, Any]):
     configurable = config.get("configurable", {})
     submission_id = configurable.get("submission_id", "default-id")
@@ -61,6 +72,7 @@ async def compile_agent(state: GraderState, config: Dict[str, Any]):
         }
     }
 
+
 async def static_agent(state: GraderState, config: Dict[str, Any]):
     run_dir = Path(state["compile"]["run_dir"])
     src = run_dir / "main.c"
@@ -83,13 +95,13 @@ async def static_agent(state: GraderState, config: Dict[str, Any]):
     score = max(0.0, 1.0 - 0.1 * len(issues))
     return {"static": {"success": True, "score": score, "issues": issues}}
 
+
 async def test_agent(state: GraderState, config: Dict[str, Any]):
     configurable = config.get("configurable", {})
     tests = configurable.get("tests", [])
 
     run_dir = Path(state["compile"]["run_dir"])
     exe = run_dir / "a.out"
-
     if not exe.exists():
         return {"test": {"success": False, "score": 0, "results": []}}
 
@@ -109,6 +121,7 @@ async def test_agent(state: GraderState, config: Dict[str, Any]):
         "test": {"success": True, "score": score, "results": results, "passed": passed, "total": len(tests)}
     }
 
+
 async def performance_agent(state: GraderState, config: Dict[str, Any]):
     run_dir = Path(state["compile"]["run_dir"])
     exe = run_dir / "a.out"
@@ -127,6 +140,7 @@ async def performance_agent(state: GraderState, config: Dict[str, Any]):
     score = 1.0 if avg < 0.05 else (0.7 if avg < 0.2 else 0.4)
     return {"perf": {"success": True, "score": score, "avg_time": avg}}
 
+
 def orchestrate(state: GraderState, config: Dict[str, Any]):
     weights = {"compile": 0.25, "test": 0.45, "static": 0.15, "perf": 0.15}
     total = 0
@@ -134,7 +148,8 @@ def orchestrate(state: GraderState, config: Dict[str, Any]):
         total += w * state.get(k, {}).get("score", 0)
     return {"final": {"score": total}}
 
-# ====== Feedback Formatter ======
+
+# === Feedback ===
 def feedback(result: GraderState):
     compile_res = result.get("compile", {})
     test_res = result.get("test", {})
@@ -144,6 +159,7 @@ def feedback(result: GraderState):
 
     fb = {"final_score": round(final_res.get("score", 0) * 100, 2), "sections": []}
 
+    # Compilation
     if compile_res:
         fb["sections"].append({
             "section": "Compilation",
@@ -152,6 +168,7 @@ def feedback(result: GraderState):
             else f"❌ Compilation failed:\n\n{compile_res.get('stderr', 'Unknown error')}"
         })
 
+    # Only proceed if compiled
     if compile_res.get("success"):
         if test_res:
             test_text = "\n".join(
@@ -188,24 +205,24 @@ def feedback(result: GraderState):
     fb["conclusion"] = (
         "✅ Excellent work! All checks passed with high performance."
         if fb["final_score"] > 80
-        else ("⚠️ Needs improvement — check logic or performance." if compile_res.get("success")
-              else "❌ Compilation failed. Please fix errors and resubmit.")
+        else ("⚠️ Needs improvement — check logic or performance."
+              if compile_res.get("success") else "❌ Compilation failed. Please fix errors and resubmit.")
     )
 
     return fb
 
-# ====== Build Graph ======
+
+# === Graph Builder ===
 def build_grader_graph():
     g = StateGraph(GraderState)
 
-    g.add_node("compile", compile_agent)
-    g.add_node("static", static_agent)
-    g.add_node("test", test_agent)
-    g.add_node("perf", performance_agent)
-    g.add_node("orchestrate", orchestrate)
+    g.add_node("compile", make_sync(compile_agent))
+    g.add_node("static", make_sync(static_agent))
+    g.add_node("test", make_sync(test_agent))
+    g.add_node("perf", make_sync(performance_agent))
+    g.add_node("orchestrate", make_sync(orchestrate))
 
     g.set_entry_point("compile")
-
     g.add_edge("compile", "static")
     g.add_edge("static", "test")
     g.add_edge("test", "perf")
