@@ -1,16 +1,16 @@
 import asyncio
 import subprocess
 import time
-import uuid
 from pathlib import Path
-from typing import TypedDict, Dict, Any, Optional
+from typing import TypedDict, Dict, Any
+
 from langgraph.graph import StateGraph, END
 
-
-WORK_DIR = Path("/tmp")  # cloud-safe
+# ====== Setup ======
+WORK_DIR = Path("runs")
 WORK_DIR.mkdir(exist_ok=True)
 
-
+# ====== Define State Schema ======
 class GraderState(TypedDict, total=False):
     compile: dict
     static: dict
@@ -18,196 +18,198 @@ class GraderState(TypedDict, total=False):
     perf: dict
     final: dict
 
-
-# ---------- subprocess helper ----------
+# ====== Windows + Cloud Safe Subprocess ======
 async def run_subprocess(cmd, input_data=None, timeout=None, cwd=None):
     loop = asyncio.get_event_loop()
 
     def _run():
-        try:
-            return subprocess.run(
-                cmd,
-                input=input_data or "",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                text=True,
-                cwd=cwd,
-            )
-        except subprocess.TimeoutExpired:
-            return subprocess.CompletedProcess(cmd, 1, "", "❌ Timeout (possibly waiting for input).")
+        return subprocess.run(
+            cmd,
+            input=input_data if input_data else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            text=True,
+            cwd=cwd
+        )
 
     return await loop.run_in_executor(None, _run)
 
+# ====== Agents ======
+async def compile_agent(state: GraderState, config: Dict[str, Any]):
+    configurable = config.get("configurable", {})
+    submission_id = configurable.get("submission_id", "default-id")
+    source_code = configurable.get("source_code", "")
 
-# ---------- Agents ----------
-async def compile_agent(state: GraderState, config: Dict[str, Any] = None):
-    conf = (config or {}).get("configurable", {})
-    submission_id = conf.get("submission_id", f"run_{uuid.uuid4().hex[:6]}")
-    code = conf.get("source_code", "")
+    run_dir = WORK_DIR / submission_id
+    run_dir.mkdir(exist_ok=True)
+    src = run_dir / "main.c"
+    src.write_text(source_code)
+    exe = run_dir / "a.out"
 
-    base_dir = WORK_DIR / f"{submission_id}_{uuid.uuid4().hex[:8]}"
-    base_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["gcc", "-std=c11", "main.c", "-o", "a.out", "-Wall", "-Wextra"]
+    proc = await run_subprocess(cmd, cwd=str(run_dir))
 
-    src = base_dir / "main.c"
-    exe = base_dir / "a.out"
-    src.write_text(code)
-
-    cmd = ["gcc", "-std=c11", str(src), "-o", str(exe), "-Wall", "-Wextra"]
-    proc = await run_subprocess(cmd, timeout=10)
     success = proc.returncode == 0
-    stderr_text = proc.stderr.strip()
-
-    if "undefined reference to `main`" in stderr_text or "undefined reference to `main'" in stderr_text:
-        stderr_text = "❌ Linker error: no main() found."
-
     return {
         "compile": {
             "success": success,
-            "stderr": stderr_text,
-            "run_dir": str(base_dir),
-            "score": 1.0 if success else 0.0,
+            "stderr": proc.stderr,
+            "stdout": proc.stdout,
+            "run_dir": str(run_dir),
+            "score": 1.0 if success else 0.0
         }
     }
 
-
-async def static_agent(state: GraderState, config: Dict[str, Any] = None):
-    if not state.get("compile", {}).get("success"):
-        return {"static": {"success": False, "score": 0.0, "issues": ["Skipped (compile failed)."]}}
-
+async def static_agent(state: GraderState, config: Dict[str, Any]):
     run_dir = Path(state["compile"]["run_dir"])
     src = run_dir / "main.c"
     issues = []
     try:
         cpp = subprocess.run(
-            ["cppcheck", "--enable=warning,style,performance", str(src)],
+            ["cppcheck", "--enable=warning,style,performance", "main.c"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             timeout=10,
+            cwd=str(run_dir)
         )
         out = cpp.stdout + cpp.stderr
         for line in out.splitlines():
-            if line.strip() and not line.startswith("Checking"):
+            if line.strip():
                 issues.append(line.strip())
-    except Exception as e:
-        issues.append(f"Static analysis error: {e}")
-
-    score = max(0.0, 1.0 - 0.05 * len(issues))
+    except Exception:
+        pass
+    score = max(0.0, 1.0 - 0.1 * len(issues))
     return {"static": {"success": True, "score": score, "issues": issues}}
 
+async def test_agent(state: GraderState, config: Dict[str, Any]):
+    configurable = config.get("configurable", {})
+    tests = configurable.get("tests", [])
 
-async def test_agent(state: GraderState, config: Dict[str, Any] = None):
-    conf = (config or {}).get("configurable", {})
-    tests = conf.get("tests", [])
     run_dir = Path(state["compile"]["run_dir"])
     exe = run_dir / "a.out"
 
+    if not exe.exists():
+        return {"test": {"success": False, "score": 0, "results": []}}
+
     results = []
     passed = 0
-    if not tests:
-        return {"test": {"success": True, "score": 0, "results": []}}
 
     for t in tests:
-        proc = await run_subprocess([str(exe)], input_data=t["input"], timeout=3)
+        proc = await run_subprocess(["./a.out"], input_data=t["input"], cwd=str(run_dir))
         out = proc.stdout.strip()
         ok = out == t["output"].strip()
         results.append({"input": t["input"], "expected": t["output"], "output": out, "passed": ok})
         if ok:
             passed += 1
 
-    score = passed / len(tests)
-    return {"test": {"success": True, "score": score, "results": results, "passed": passed, "total": len(tests)}}
+    score = passed / len(tests) if tests else 0
+    return {
+        "test": {"success": True, "score": score, "results": results, "passed": passed, "total": len(tests)}
+    }
 
-
-async def performance_agent(state: GraderState, config: Dict[str, Any] = None):
-    if not state.get("compile", {}).get("success"):
-        return {"perf": {"success": False, "score": 0.0, "avg_time": 0.0}}
-
+async def performance_agent(state: GraderState, config: Dict[str, Any]):
     run_dir = Path(state["compile"]["run_dir"])
     exe = run_dir / "a.out"
-    sample_input = "0 0\n"
+    if not exe.exists():
+        return {"perf": {"success": False, "score": 0, "avg_time": 0}}
 
+    sample_input = "2 3"
     times = []
+
     for _ in range(3):
         start = time.perf_counter()
-        await run_subprocess([str(exe)], input_data=sample_input, timeout=3)
+        await run_subprocess(["./a.out"], input_data=sample_input, cwd=str(run_dir))
         times.append(time.perf_counter() - start)
-    avg = sum(times) / len(times) if times else 0.0
-    score = 1.0 if avg < 0.1 else (0.7 if avg < 1.0 else 0.3)
+
+    avg = sum(times) / len(times)
+    score = 1.0 if avg < 0.05 else (0.7 if avg < 0.2 else 0.4)
     return {"perf": {"success": True, "score": score, "avg_time": avg}}
 
-
-def orchestrate(state: GraderState, config: Dict[str, Any] = None):
-    weights = {"compile": 0.25, "test": 0.4, "static": 0.2, "perf": 0.15}
-    if not state.get("compile", {}).get("success"):
-        return {"final": {"score": 0.0}}
-    total = sum(w * state.get(k, {}).get("score", 0.0) for k, w in weights.items())
+def orchestrate(state: GraderState, config: Dict[str, Any]):
+    weights = {"compile": 0.25, "test": 0.45, "static": 0.15, "perf": 0.15}
+    total = 0
+    for k, w in weights.items():
+        total += w * state.get(k, {}).get("score", 0)
     return {"final": {"score": total}}
 
-
-# ---------- Feedback ----------
+# ====== Feedback Formatter ======
 def feedback(result: GraderState):
-    fb = {"final_score": round(result.get("final", {}).get("score", 0.0) * 100, 2), "sections": []}
-
     compile_res = result.get("compile", {})
     test_res = result.get("test", {})
     static_res = result.get("static", {})
     perf_res = result.get("perf", {})
+    final_res = result.get("final", {})
 
-    fb["sections"].append({
-        "section": "Compilation",
-        "score": round(compile_res.get("score", 0) * 100, 1),
-        "text": "✅ Compiled successfully." if compile_res.get("success") else compile_res.get("stderr", "")
-    })
+    fb = {"final_score": round(final_res.get("score", 0) * 100, 2), "sections": []}
 
-    if test_res:
+    if compile_res:
         fb["sections"].append({
-            "section": "Functional Tests",
-            "score": round(test_res.get("score", 0) * 100, 1),
-            "text": f"Passed {test_res.get('passed', 0)}/{test_res.get('total', 0)} tests."
+            "section": "Compilation",
+            "score": round(compile_res.get("score", 0) * 100, 1),
+            "text": "✅ Compiled successfully." if compile_res.get("success")
+            else f"❌ Compilation failed:\n\n{compile_res.get('stderr', 'Unknown error')}"
         })
 
-    if static_res:
-        issues = static_res.get("issues", [])
-        fb["sections"].append({
-            "section": "Static Analysis",
-            "score": round(static_res.get("score", 0) * 100, 1),
-            "text": "✅ No issues." if not issues else f"⚠️ {len(issues)} issue(s):\n" + "\n".join(issues[:5])
-        })
+    if compile_res.get("success"):
+        if test_res:
+            test_text = "\n".join(
+                [f"Input: {r['input']} | Expected: {r['expected']} | Got: {r['output']} | {'✅' if r['passed'] else '❌'}"
+                 for r in test_res.get("results", [])]
+            )
+            fb["sections"].append({
+                "section": "Test Cases",
+                "score": round(test_res.get("score", 0) * 100, 1),
+                "text": test_text if test_text else "No test cases run."
+            })
 
-    if perf_res:
-        fb["sections"].append({
-            "section": "Performance",
-            "score": round(perf_res.get("score", 0) * 100, 1),
-            "text": f"⏱ Avg runtime: {perf_res.get('avg_time', 0.0):.4f}s"
-        })
+        if static_res:
+            if static_res.get("issues"):
+                fb["sections"].append({
+                    "section": "Static Analysis",
+                    "score": round(static_res.get("score", 0) * 100, 1),
+                    "text": "\n".join(static_res.get("issues", []))
+                })
+            else:
+                fb["sections"].append({
+                    "section": "Static Analysis",
+                    "score": 100,
+                    "text": "✅ No issues found."
+                })
+
+        if perf_res:
+            fb["sections"].append({
+                "section": "Performance",
+                "score": round(perf_res.get("score", 0) * 100, 1),
+                "text": f"Avg runtime: {perf_res.get('avg_time', 0):.4f}s"
+            })
 
     fb["conclusion"] = (
-        "🏆 Excellent! Everything works perfectly." if fb["final_score"] >= 80
-        else "⚙️ Needs improvement — check logic or performance."
+        "✅ Excellent work! All checks passed with high performance."
+        if fb["final_score"] > 80
+        else ("⚠️ Needs improvement — check logic or performance." if compile_res.get("success")
+              else "❌ Compilation failed. Please fix errors and resubmit.")
     )
+
     return fb
 
-
-# ---------- Graph Builder ----------
+# ====== Build Graph ======
 def build_grader_graph():
     g = StateGraph(GraderState)
+
     g.add_node("compile", compile_agent)
     g.add_node("static", static_agent)
     g.add_node("test", test_agent)
     g.add_node("perf", performance_agent)
     g.add_node("orchestrate", orchestrate)
+
     g.set_entry_point("compile")
 
-    def after_compile(state: GraderState):
-        if state.get("compile", {}).get("success"):
-            return "next"
-        return "end"
-
-    g.add_conditional_edges("compile", after_compile, {"next": "static", "end": "orchestrate"})
+    g.add_edge("compile", "static")
     g.add_edge("static", "test")
     g.add_edge("test", "perf")
     g.add_edge("perf", "orchestrate")
     g.add_edge("orchestrate", END)
+
     return g.compile()
