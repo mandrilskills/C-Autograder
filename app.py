@@ -33,14 +33,16 @@ if st.button("🚀 Run Autograder"):
 
         async def run_graph():
             g = build_grader_graph()
-            inputs = {
+            inputs = {}  # state starts empty
+            config = {
                 "configurable": {
                     "submission_id": "user1",
                     "source_code": source_code,
                     "tests": tests
                 }
             }
-            result = await g.ainvoke(inputs)
+            # ✅ explicitly pass config so nodes get it
+            result = await g.ainvoke(inputs, config=config)
             return result
 
         loop = asyncio.new_event_loop()
