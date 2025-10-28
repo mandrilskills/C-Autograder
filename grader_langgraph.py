@@ -40,12 +40,12 @@ async def run_subprocess(cmd, input_data: Optional[str] = None, timeout: Optiona
 
 # ====== Agents (all accept config=None) ======
 async def compile_agent(state: GraderState, config: Dict[str, Any] = None):
-    """Compile the uploaded C source file. Works whether config is passed or not."""
+    """Compile the uploaded C source file with full path awareness."""
     configurable = (config or {}).get("configurable", {})
     submission_id = configurable.get("submission_id", f"run_{uuid.uuid4().hex[:6]}")
     source_code = configurable.get("source_code", "")
 
-    # Create a unique subfolder for this run (avoid locking)
+    # Create unique subfolder
     run_dir = WORK_DIR / f"{submission_id}_{uuid.uuid4().hex[:8]}"
     run_dir.mkdir(exist_ok=True)
 
@@ -66,15 +66,20 @@ async def compile_agent(state: GraderState, config: Dict[str, Any] = None):
             }
         }
 
-    # Run gcc in the run_dir (important for cloud)
-    cmd = ["gcc", "-std=c11", "main.c", "-o", "a.out", "-Wall", "-Wextra"]
-    proc = await run_subprocess(cmd, timeout=10, cwd=str(run_dir))
+    # ✅ Use full absolute path instead of cwd-relative name
+    cmd = ["gcc", "-std=c11", str(src), "-o", str(exe), "-Wall", "-Wextra"]
+    proc = await run_subprocess(cmd, timeout=10)  # remove cwd argument
+
     success = proc.returncode == 0
     stderr_text = proc.stderr.strip()
 
     # Friendly message for missing main
     if "undefined reference to `main'" in stderr_text or "undefined reference to `main`" in stderr_text:
-        stderr_text = "❌ Linker error: no `main()` found. Make sure your C file defines `int main() {...}`."
+        stderr_text = (
+            "❌ Linker error: no `main()` found.\n"
+            "This can occur if the compiler didn't read your file correctly. "
+            "Please ensure the uploaded file isn't empty or malformed."
+        )
 
     return {
         "compile": {
@@ -86,6 +91,7 @@ async def compile_agent(state: GraderState, config: Dict[str, Any] = None):
             "score": 1.0 if success else 0.0,
         }
     }
+
 
 async def static_agent(state: GraderState, config: Dict[str, Any] = None):
     """Run cppcheck static analysis."""
@@ -220,3 +226,4 @@ def build_grader_graph():
     g.add_edge("orchestrate", END)
 
     return g.compile()
+
