@@ -6,19 +6,22 @@ from langgraph.graph import StateGraph, END
 import asyncio
 import os
 
-
 # === Utility: wrap async → sync for LangGraph ===
 def make_sync(agent):
     """Wrap async agent in sync for compatibility (works with Streamlit Cloud and Windows)."""
     def wrapper(state, config):
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running():
+                return loop.run_until_complete(agent(state, config))
+        except RuntimeError:
+            pass
         return asyncio.run(agent(state, config))
     return wrapper
-
 
 # === Setup ===
 WORK_DIR = Path("runs")
 WORK_DIR.mkdir(exist_ok=True)
-
 
 # === Define State Schema ===
 class GraderState(TypedDict, total=False):
@@ -27,7 +30,6 @@ class GraderState(TypedDict, total=False):
     test: dict
     perf: dict
     final: dict
-
 
 # === Cross-platform subprocess helper ===
 async def run_subprocess(cmd, input_data=None, timeout=None, cwd=None):
@@ -44,9 +46,7 @@ async def run_subprocess(cmd, input_data=None, timeout=None, cwd=None):
             text=True,
             cwd=cwd
         )
-
     return await loop.run_in_executor(None, _run)
-
 
 # === Agents ===
 async def compile_agent(state: GraderState, config: Dict[str, Any]):
@@ -76,7 +76,6 @@ async def compile_agent(state: GraderState, config: Dict[str, Any]):
         }
     }
 
-
 async def static_agent(state: GraderState, config: Dict[str, Any]):
     run_dir = Path(state["compile"]["run_dir"])
     issues = []
@@ -98,7 +97,6 @@ async def static_agent(state: GraderState, config: Dict[str, Any]):
     score = max(0.0, 1.0 - 0.1 * len(issues))
     return {"static": {"success": True, "score": score, "issues": issues}}
 
-
 async def test_agent(state: GraderState, config: Dict[str, Any]):
     configurable = config.get("configurable", {})
     tests = configurable.get("tests", [])
@@ -108,7 +106,6 @@ async def test_agent(state: GraderState, config: Dict[str, Any]):
     if not exe_path.exists():
         return {"test": {"success": False, "score": 0, "results": []}}
 
-    # ✅ Cross-platform execution command
     exec_cmd = [str(exe_path)] if os.name == "nt" else ["./" + exe_path.name]
 
     results = []
@@ -131,7 +128,6 @@ async def test_agent(state: GraderState, config: Dict[str, Any]):
         "test": {"success": True, "score": score, "results": results, "passed": passed, "total": len(tests)}
     }
 
-
 async def performance_agent(state: GraderState, config: Dict[str, Any]):
     run_dir = Path(state["compile"]["run_dir"])
     exe_path = Path(run_dir) / state["compile"]["exe_name"]
@@ -152,14 +148,12 @@ async def performance_agent(state: GraderState, config: Dict[str, Any]):
     score = 1.0 if avg < 0.05 else (0.7 if avg < 0.2 else 0.4)
     return {"perf": {"success": True, "score": score, "avg_time": avg}}
 
-
 def orchestrate(state: GraderState, config: Dict[str, Any]):
     weights = {"compile": 0.25, "test": 0.45, "static": 0.15, "perf": 0.15}
     total = 0
     for k, w in weights.items():
         total += w * state.get(k, {}).get("score", 0)
     return {"final": {"score": total}}
-
 
 # === Feedback ===
 def feedback(result: GraderState):
@@ -220,7 +214,6 @@ def feedback(result: GraderState):
     )
 
     return fb
-
 
 # === Build LangGraph ===
 def build_grader_graph():
