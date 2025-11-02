@@ -1,14 +1,14 @@
 # ---- Streamlit App ----
 streamlit==1.38.0
 
-# ---- LangChain Ecosystem (matching versions) ----
+# ---- LangChain Ecosystem ----
 langchain==0.2.14
 langchain-core==0.2.36
 langchain-community==0.2.11
 
 # ---- Google Gemini Integration ----
 langchain-google-genai==1.0.6
-google-generativeai==0.7.2
+google-generativeai==0.5.2
 
 # ---- LangGraph (for agent orchestration) ----
 langgraph
