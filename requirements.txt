@@ -1,6 +1,9 @@
 streamlit
 langgraph
-langchain-google-genai
-google-generativeai
+langchain==0.2.14
+langchain-core==0.2.28
+langchain-community==0.2.11
+langchain-google-genai==1.0.6
+google-generativeai==0.7.2
 reportlab
-
+python-dotenv
