@@ -1,83 +1,133 @@
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.prompts import PromptTemplate
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
-from reportlab.lib.styles import getSampleStyleSheet
 import json
-import io
+import streamlit as st
+from dotenv import load_dotenv
+import os
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
-# === Initialize Gemini Model ===
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.3)
+# Load environment variables (for local dev)
+load_dotenv()
 
-# === Test Case Generation ===
-def generate_test_cases(source_code: str):
-    prompt = PromptTemplate.from_template("""
-    You are an expert C programmer. Analyze the C program below and 
-    generate 5 practical test cases that fully validate its correctness.
-    Output a pure JSON list like:
-    [{"input": "...", "expected_output": "..."}, ...]
-    Code:
-    ```c
-    {source_code}
-    ```
-    """)
-    resp = llm.invoke(prompt.format(source_code=source_code))
-    return resp.content
+# Import Gemini LLM
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-# === Detailed Report Generation ===
-def generate_detailed_report(feedback_obj: dict):
-    prompt = PromptTemplate.from_template("""
-    You are an expert AI reviewer. Based on this structured feedback, 
-    write a detailed paragraph-style report including:
-    - Overall evaluation summary
-    - Compilation outcome
-    - Logic & test performance analysis
-    - Static code issues
-    - Performance feedback
-    - Final suggestions for improvement.
-    Feedback JSON:
-    {feedback_obj}
-    """)
-    resp = llm.invoke(prompt.format(feedback_obj=str(feedback_obj)))
-    return resp.content
+# Initialize Gemini model
+llm = ChatGoogleGenerativeAI(
+    model="gemini-1.5-flash",
+    google_api_key=os.getenv("GOOGLE_API_KEY"),
+    temperature=0.3,
+    max_output_tokens=1024
+)
 
-# === PDF Report Creation ===
-def create_pdf_report(feedback_obj: dict, ai_report: str) -> bytes:
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4)
-    styles = getSampleStyleSheet()
-    story = []
+# ---------- Utility: Safe JSON Parsing ---------- #
+def safe_parse_json(text: str):
+    """
+    Attempts to safely parse Gemini LLM output into JSON.
+    If JSON decoding fails, tries to extract JSON substring.
+    """
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find('['), text.rfind(']')
+        if start != -1 and end != -1:
+            try:
+                return json.loads(text[start:end + 1])
+            except Exception:
+                pass
+        st.error("⚠️ Gemini returned invalid JSON. Displaying raw output below:")
+        st.write(text)
+        return []
 
-    story.append(Paragraph("C Code Autograder – AI Evaluation Report", styles["Title"]))
-    story.append(Spacer(1, 12))
 
-    # Final score
-    story.append(Paragraph(f"Final Score: {feedback_obj.get('final_score', 0)}%", styles["Heading2"]))
-    story.append(Spacer(1, 12))
+# ---------- 1️⃣ Generate Test Cases ---------- #
+def generate_test_cases(c_code: str):
+    """
+    Uses Gemini to generate valid JSON test cases for the provided C code.
+    Each test case should contain 'input' and 'expected_output'.
+    """
+    st.info("🧠 Generating test cases using Gemini...")
+    prompt = f"""
+You are an expert C programmer and software tester.
+Analyze the following C code and generate 5 meaningful test cases.
+Each test case should have:
+  - "input": simulated stdin input (string)
+  - "expected_output": the exact expected stdout output (string)
 
-    # Table of section results
-    data = [["Section", "Score", "Summary"]]
-    for sec in feedback_obj["sections"]:
-        data.append([sec["section"], f"{sec['score']}%", sec["text"][:100] + "..."])
-    table = Table(data, colWidths=[120, 60, 320])
-    table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.lightblue),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("ALIGN", (1, 1), (-1, -1), "CENTER"),
-    ]))
-    story.append(table)
-    story.append(Spacer(1, 18))
+Return ONLY a valid JSON array like this:
+[
+  {{"input": "5\\n", "expected_output": "120\\n"}},
+  {{"input": "0\\n", "expected_output": "1\\n"}}
+]
 
-    story.append(Paragraph("AI Generated Detailed Analysis", styles["Heading2"]))
-    story.append(Paragraph(ai_report, styles["Normal"]))
-    story.append(Spacer(1, 12))
+C code:
+{c_code}
+"""
 
-    story.append(Paragraph("Conclusion", styles["Heading2"]))
-    story.append(Paragraph(feedback_obj.get("conclusion", ""), styles["Normal"]))
+    try:
+        response = llm.invoke(prompt)
+        raw_output = response.content if hasattr(response, "content") else str(response)
+        data = safe_parse_json(raw_output)
 
-    doc.build(story)
-    pdf = buf.getvalue()
-    buf.close()
-    return pdf
+        if not data or not isinstance(data, list):
+            st.error("❌ No valid test cases generated. Please try again.")
+            st.write("Model output:", raw_output)
+            return []
+
+        st.success("✅ Test cases generated successfully.")
+        return data
+
+    except Exception as e:
+        st.error(f"Error generating test cases: {e}")
+        return []
+
+
+# ---------- 2️⃣ Generate Detailed Report ---------- #
+def generate_detailed_report(c_code: str, test_results: list):
+    """
+    Summarizes the performance of the submitted code based on test results.
+    """
+    prompt = f"""
+You are an expert code reviewer and programming instructor.
+You are given the original C code and its grading results.
+
+C Code:
+{c_code}
+
+Test Results (JSON):
+{json.dumps(test_results, indent=2)}
+
+Write a detailed report that includes:
+1. Summary of overall correctness
+2. Logical or syntax issues (if any)
+3. Edge cases missed
+4. Recommendations for improvement
+"""
+    try:
+        response = llm.invoke(prompt)
+        return response.content if hasattr(response, "content") else str(response)
+    except Exception as e:
+        st.error(f"Error generating report: {e}")
+        return "Report generation failed."
+
+
+# ---------- 3️⃣ Create PDF Report ---------- #
+def create_pdf_report(report_text: str, filename: str = "grading_report.pdf"):
+    """
+    Generates a downloadable PDF report using ReportLab.
+    """
+    pdf_path = os.path.join("outputs", filename)
+    os.makedirs("outputs", exist_ok=True)
+
+    c = canvas.Canvas(pdf_path, pagesize=letter)
+    width, height = letter
+    y = height - 50
+    c.setFont("Helvetica", 11)
+    for line in report_text.split("\n"):
+        c.drawString(40, y, line)
+        y -= 15
+        if y < 40:  # new page
+            c.showPage()
+            y = height - 50
+            c.setFont("Helvetica", 11)
+    c.save()
+    return pdf_path
