@@ -1,50 +1,77 @@
 import json
+import os
+import time
+import concurrent.futures
 import streamlit as st
 from dotenv import load_dotenv
-import os
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-# Load environment variables
+# Load .env variables for local testing
 load_dotenv()
 
-# Initialize Gemini LLM
+# -------------------- Gemini Model -------------------- #
 llm = ChatGoogleGenerativeAI(
     model="gemini-1.5-flash",
     google_api_key=os.getenv("GOOGLE_API_KEY"),
     temperature=0.3,
-    max_output_tokens=1024
+    max_output_tokens=1024,
 )
 
-# ---------- Utility: Safe JSON Parsing ---------- #
+# ===================================================== #
+# Utility Functions
+# ===================================================== #
+
+def call_with_timeout(prompt, timeout=40):
+    """
+    Executes Gemini call with timeout protection.
+    """
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future = executor.submit(llm.invoke, prompt)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            st.error(f"⏰ Gemini request timed out after {timeout} seconds.")
+            return None
+
+
 def safe_parse_json(text: str):
-    """Safely parse Gemini LLM output into JSON."""
+    """
+    Safely parse JSON from Gemini output.
+    If it fails, attempts to extract valid substring.
+    """
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        start, end = text.find('['), text.rfind(']')
+        start, end = text.find("["), text.rfind("]")
         if start != -1 and end != -1:
             try:
                 return json.loads(text[start:end + 1])
             except Exception:
                 pass
-        st.warning("⚠️ Gemini returned unstructured data. Displaying raw output below.")
+        st.warning("⚠️ Gemini returned unstructured output. Displaying raw output below.")
         st.write(text)
         return []
 
 
-# ---------- 1️⃣ Generate Test Cases ---------- #
+# ===================================================== #
+# 1️⃣ Generate Test Cases with Retry + Timeout
+# ===================================================== #
+
 def generate_test_cases(c_code: str):
-    """Generate structured test cases for the provided C code."""
+    """
+    Generate valid JSON test cases for the provided C code using Gemini.
+    Includes timeout, retry, and auto-fallback triggers.
+    """
     st.info("🧠 Generating test cases using Gemini...")
+
     prompt = f"""
 You are an expert C programmer and software tester.
-Analyze the following C code and generate 5 meaningful test cases.
+Analyze the following C code and generate up to 5 meaningful test cases.
 Each test case should include:
-  - "input": simulated stdin input (string)
-  - "expected_output": the exact expected stdout output (string)
-
+  - "input": the stdin input string
+  - "expected_output": the stdout output string
 Return ONLY a valid JSON array like this:
 [
   {{"input": "5\\n", "expected_output": "120\\n"}},
@@ -55,84 +82,109 @@ C code:
 {c_code}
 """
 
-    try:
-        response = llm.invoke(prompt)
-        raw_output = response.content if hasattr(response, "content") else str(response)
-        data = safe_parse_json(raw_output)
+    response = None
+    for attempt in range(3):
+        st.write(f"🔁 Attempt {attempt + 1} to contact Gemini...")
+        response = call_with_timeout(prompt, timeout=40)
+        if response:
+            break
+        time.sleep(2)
 
-        if not data or not isinstance(data, list):
-            st.warning("⚠️ Unable to generate valid test cases.")
-            return None
-
-        st.success("✅ Test cases generated successfully.")
-        return data
-
-    except Exception as e:
-        st.error(f"Error generating test cases: {e}")
+    if not response:
+        st.error("❌ Gemini failed to generate test cases after multiple attempts.")
         return None
 
+    raw_output = response.content if hasattr(response, "content") else str(response)
+    data = safe_parse_json(raw_output)
 
-# ---------- 2️⃣ Fallback Evaluation System ---------- #
+    if not data or not isinstance(data, list):
+        st.warning("⚠️ Gemini response invalid or empty. Switching to fallback evaluation.")
+        return None
+
+    st.success("✅ Test cases generated successfully.")
+    return data
+
+
+# ===================================================== #
+# 2️⃣ Fallback Code Evaluation
+# ===================================================== #
+
 def fallback_code_evaluation(c_code: str):
-    """Perform qualitative code evaluation when no test cases can be generated."""
+    """
+    Fallback mode: static qualitative evaluation when test-case generation fails.
+    """
     st.info("🧩 Performing static code evaluation via Gemini...")
     prompt = f"""
 You are a senior C programming instructor and code reviewer.
 Analyze the following C program and produce a structured evaluation covering:
 
-1. **Program Intent** – What the program seems to do.
-2. **Syntax & Logic Check** – Identify syntax errors or logical flaws.
-3. **Completeness** – Is it functional or incomplete?
-4. **Input/Output Handling** – How well does it manage user I/O?
-5. **Code Quality** – Naming, readability, indentation, clarity.
-6. **Recommendations** – Improvements, missing edge cases, optimization hints.
+1. Program Intent – What the code attempts to do.
+2. Syntax & Logic Check – Syntax issues or logical flaws.
+3. Completeness – Is it functional or partial?
+4. Input/Output Handling – How user I/O is managed.
+5. Code Quality – Naming, readability, indentation, clarity.
+6. Recommendations – Improvements and missing cases.
 
-Return your analysis in a well-written paragraph form.
+Return your analysis as a descriptive paragraph.
 C Code:
 {c_code}
 """
-    try:
-        response = llm.invoke(prompt)
-        report = response.content if hasattr(response, "content") else str(response)
-        st.success("✅ Static evaluation completed.")
-        return report
-    except Exception as e:
-        st.error(f"Fallback evaluation failed: {e}")
-        return "Unable to evaluate the code."
+
+    for attempt in range(2):
+        st.write(f"🧠 Static evaluation attempt {attempt + 1}...")
+        response = call_with_timeout(prompt, timeout=50)
+        if response:
+            st.success("✅ Static evaluation completed successfully.")
+            return response.content if hasattr(response, "content") else str(response)
+        time.sleep(2)
+
+    st.error("⚠️ Fallback evaluation failed after multiple attempts.")
+    return "Unable to perform static evaluation."
 
 
-# ---------- 3️⃣ Generate Detailed Report ---------- #
+# ===================================================== #
+# 3️⃣ Generate Detailed Report
+# ===================================================== #
+
 def generate_detailed_report(c_code: str, test_results: list):
-    """Create a descriptive evaluation report based on code and test results."""
-    st.info("📝 Generating final report...")
+    """
+    Summarize program performance based on test results.
+    """
+    st.info("📝 Generating detailed performance report...")
+
     prompt = f"""
 You are a programming examiner.
-You are given a student's C code and the test results.
+You are given the student's C code and the corresponding test case results.
 
 C Code:
 {c_code}
 
-Test Results:
+Test Results (JSON):
 {json.dumps(test_results, indent=2)}
 
-Write a detailed evaluation report including:
-1. Summary of correctness
-2. Errors or deviations in output
-3. Logical or syntactical issues
+Prepare a detailed report including:
+1. Overall correctness summary
+2. Logical or syntax errors
+3. Output mismatches
 4. Missed edge cases
-5. Final remarks and feedback
+5. Final comments and improvement suggestions
 """
-    try:
-        response = llm.invoke(prompt)
-        return response.content if hasattr(response, "content") else str(response)
-    except Exception as e:
-        st.error(f"Error generating report: {e}")
-        return "Report generation failed."
+
+    response = call_with_timeout(prompt, timeout=60)
+    if not response:
+        return "Report generation timed out. Partial results only."
+
+    return response.content if hasattr(response, "content") else str(response)
 
 
-# ---------- 4️⃣ Create PDF Report ---------- #
+# ===================================================== #
+# 4️⃣ Generate PDF Report
+# ===================================================== #
+
 def create_pdf_report(report_text: str, filename: str = "grading_report.pdf"):
-    """Generate a downloadable PDF report."""
+    """
+    Create a downloadable PDF report for user feedback.
+    """
     os.makedirs("outputs", exist_ok=True)
     pdf_path = os.path.join("outputs", filename)
 
