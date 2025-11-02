@@ -229,3 +229,11 @@ def build_grader_graph():
     g.add_edge("perf", "orchestrate")
     g.add_edge("orchestrate", END)
     return g.compile()
+
+# === Optional LLM Summarizer (not used directly by app.py) ===
+def summarize_with_llm(result: GraderState):
+    try:
+        from llm_agents import generate_detailed_report
+        return generate_detailed_report(result)
+    except Exception:
+        return "LLM summary unavailable."
