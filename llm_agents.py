@@ -7,14 +7,12 @@ from groq_llm import generate_test_cases_with_groq
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-
 # ---------------- GEMINI SETUP ----------------
 def configure_gemini():
     api_key = os.getenv("GENAI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        raise EnvironmentError("Gemini API key not found in environment variables.")
+        raise EnvironmentError("Gemini API key not found.")
     genai.configure(api_key=api_key)
-
 
 def _call_gemini(prompt: str, model_name="gemini-2.5-flash", max_output_tokens=900) -> str:
     """Internal Gemini call"""
@@ -30,22 +28,23 @@ def _call_gemini(prompt: str, model_name="gemini-2.5-flash", max_output_tokens=9
         logger.warning(f"Gemini model {model_name} failed: {e}")
     return None
 
-
-# ---------------- TEST CASE GENERATION (Groq + OSS 20B) ----------------
+# ---------------- TEST CASE GENERATION (Groq OSS 20B) ----------------
 def generate_test_cases_with_logging(code_text: str, max_cases: int = 8) -> dict:
-    """Uses Groq API (model: openai/gpt-oss-20b) for test case generation."""
-    res = generate_test_cases_with_groq(code_text, max_cases)
-    if res["status"] == "ok" and res["tests"]:
-        return res
-    logger.warning("Groq OSS 20B failed, using heuristic fallback.")
+    """Uses Groq API (openai/gpt-oss-20b) for test case generation."""
+    for attempt in range(2):
+        res = generate_test_cases_with_groq(code_text, max_cases)
+        if res["status"] == "ok" and res["tests"]:
+            logger.info(f"Groq OSS 20B succeeded on attempt {attempt+1}")
+            return res
+        logger.warning(f"Groq OSS 20B attempt {attempt+1} failed: {res['reason']}")
+    logger.warning("Falling back to heuristic test generation.")
     return {
         "status": "fallback",
         "tests": _heuristic_test_gen(code_text, max_cases),
-        "reason": "Groq OSS 20B unavailable; heuristic fallback used",
+        "reason": "Groq OSS 20B failed twice; heuristic fallback used",
     }
 
-
-# ---------------- HEURISTIC FALLBACK ----------------
+# ---------------- FALLBACK ----------------
 def _heuristic_test_gen(code_text: str, max_cases: int = 5):
     code = code_text.lower()
     if "largest" in code:
@@ -62,14 +61,13 @@ def _heuristic_test_gen(code_text: str, max_cases: int = 5):
     else:
         return ["1::1", "2::2"]
 
-
 # ---------------- GEMINI REPORT GENERATION ----------------
 def generate_llm_report(evaluation: dict) -> str:
     """Generate detailed evaluation report using Gemini LLM."""
     prompt = f"""
 You are an expert C programming evaluator.
 
-Based on the following evaluation JSON, write a detailed structured report containing:
+Analyze the following evaluation JSON and write a structured report with:
 1. Summary
 2. Compilation Details
 3. Static Analysis
@@ -77,17 +75,14 @@ Based on the following evaluation JSON, write a detailed structured report conta
 5. Performance Evaluation
 6. Recommendations
 
-Ensure the response is analytical, technically sound, and formatted clearly.
-
 Evaluation JSON:
 {evaluation}
 """
-    report = _call_gemini(prompt, model_name="gemini-2.5-flash")
+    report = _call_gemini(prompt, "gemini-2.5-flash")
     if not report:
         logger.info("Gemini 2.5 Flash failed, trying 1.5 Pro...")
-        report = _call_gemini(prompt, model_name="gemini-1.5-pro")
+        report = _call_gemini(prompt, "gemini-1.5-pro")
     return report or "(LLM report generation failed.)"
-
 
 def test_gemini_connection() -> str:
     try:
@@ -97,4 +92,3 @@ def test_gemini_connection() -> str:
         return "Gemini reachable but empty."
     except Exception as e:
         return f"Gemini connection failed: {e}"
-
