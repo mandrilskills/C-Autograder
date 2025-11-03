@@ -207,19 +207,19 @@ if st.button("🏁 Run Evaluation"):
                 report_text = "\n\n".join(lines)
 
             # Display (styled, non-editable)
-           st.markdown(
-    f"""
-    <div style="
-        background-color: #fbfbfb;
-        padding: 16px;
-        border-radius: 12px;
-        border: 1px solid #e2e2e2;
-        color: #111;">
-        {report_text.replace('\n', '<br/>')}
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+           safe_html = report_text.replace("\n", "<br/>")
+html_block = """
+<div style="
+    background-color: #fbfbfb;
+    padding: 16px;
+    border-radius: 12px;
+    border: 1px solid #e2e2e2;
+    color: #111;">
+    {}
+</div>
+""".format(safe_html)
+st.markdown(html_block, unsafe_allow_html=True)
+
 
 
             # Provide user info if we had to retry/fallback
@@ -259,4 +259,5 @@ if st.button("🏁 Run Evaluation"):
             )
 
             st.caption("If the report looks short, the system retried the LLM and provided a local fallback to ensure you always receive helpful feedback.")
+
 
