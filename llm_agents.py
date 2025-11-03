@@ -27,23 +27,38 @@ def call_gemini(prompt: str, max_output_tokens: int = 800, timeout: int = 30) ->
         return None
     api_key = os.getenv("GENAI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        logger.warning("GENAI_API_KEY not set.")
+        logger.warning("GENAI_API_KEY not set in environment.")
         return None
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content(
             prompt,
-            generation_config={"max_output_tokens": max_output_tokens}
+            generation_config={"max_output_tokens": max_output_tokens},
         )
-        if response and hasattr(response, "text"):
+
+        # ---- Added compatibility checks ----
+        if hasattr(response, "text") and response.text:
             return response.text.strip()
-        # some SDK versions return different structure
-        if response and isinstance(response, dict) and response.get("candidates"):
-            return response["candidates"][0].get("content", "").strip()
+
+        if hasattr(response, "candidates") and response.candidates:
+            parts = response.candidates[0].content.parts
+            if parts and hasattr(parts[0], "text"):
+                return parts[0].text.strip()
+
+        # some SDKs return dict-like structures
+        if isinstance(response, dict):
+            cand = response.get("candidates", [{}])[0]
+            text = cand.get("content", {}).get("parts", [{}])[0].get("text")
+            if text:
+                return text.strip()
+
+        logger.warning("Gemini returned unexpected response: %s", str(response)[:400])
+        return None
     except Exception as e:
         logger.exception("Gemini API call failed: %s", e)
-    return None
+        return None
+
 
 # Generate test cases (LLM first, fallback second)
 def generate_test_cases(code_text: str, max_cases: int = 6) -> List[str]:
@@ -53,8 +68,7 @@ def generate_test_cases(code_text: str, max_cases: int = 6) -> List[str]:
     # Prompt should be short & structured — LLM must return lines with input::expected_output
     prompt = (
         "You are an assistant that generates simple, deterministic input-output test cases "
-        "for a C program. Return up to {max} test cases, one per line, in the format:\n"
-        "input::expected_output\n\n"
+        "for a C program. Return up to {max} test cases, one per line, in any comfortable format\n"
         "Only provide plain lines of testcases — do not add commentary.\n\n"
         "C PROGRAM:\n"
         .format(max=max_cases) +
@@ -111,6 +125,7 @@ def generate_detailed_report(evaluation: Dict[str, Any]) -> str:
 
     text = call_gemini(prompt, max_output_tokens=1000)
     if text:
+        logger.info("Gemini raw response (first 200 chars): %s", text[:200] if text else "None")
         return text
 
     # Fallback textual report (no LLM)
