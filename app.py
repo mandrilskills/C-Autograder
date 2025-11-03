@@ -7,27 +7,27 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 import json
 import logging
-
+# IMPORTS FOR SECURITY FIX
+import shutil 
 # imports from local modules
 import llm_agents
 from llm_agents import generate_test_cases_with_logging
 from grader_langgraph import run_grader_pipeline
-
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 # Page setup
 st.set_page_config(page_title="C Autograder – Groq OSS 20B + Gemini 2.5 Flash", layout="wide")
-
-st.title("🎓 C Autograder – Groq OSS 20B + Gemini 2.5 Flash")
+st.title(" 🎓  C Autograder – Groq OSS 20B + Gemini 2.5 Flash")
 st.caption("Groq (openai/gpt-oss-20b) → Test cases · GCC/Cppcheck → Evaluation · Gemini 2.5 Flash → Report")
-
 # ---------------- Diagnostics ----------------
-with st.expander("🔧 Environment Diagnostics"):
+with st.expander(" 🔧  Environment Diagnostics"):
+    # FIX: Replaced os.system() with shutil.which for security and best practice
+    gcc_path = shutil.which("gcc")
+    cppcheck_path = shutil.which("cppcheck")
     env_info = {
-        "gcc": os.system("which gcc > /dev/null") == 0,
-        "cppcheck": os.system("which cppcheck > /dev/null") == 0,
+        "gcc": bool(gcc_path),
+        "cppcheck": bool(cppcheck_path),
         "groq_api": bool(os.getenv("GROQ_API_KEY")),
         "genai_api": bool(os.getenv("GENAI_API_KEY")),
     }
@@ -36,32 +36,28 @@ with st.expander("🔧 Environment Diagnostics"):
         st.text(llm_agents.test_gemini_connection())
     except Exception as e:
         st.write(f"Gemini connection test failed: {e}")
-
 # ---------------- Code Input ----------------
-st.header("1️⃣ Upload or Paste C Code")
+st.header("1️ ⃣  Upload or Paste C Code")
 uploaded = st.file_uploader("Upload a .c file", type=["c"])
 code_text = uploaded.read().decode("utf-8") if uploaded else st.text_area("Paste your C code here:", height=300)
-
 # ---------------- Test Case Generation ----------------
-if st.button("🚀 Generate Test Cases (Groq OSS 20B)"):
+if st.button(" 🚀  Generate Test Cases (Groq OSS 20B)"):
     if not code_text or not code_text.strip():
         st.error("Please enter valid C code first.")
     else:
         with st.spinner("Generating test cases using Groq (openai/gpt-oss-20b)..."):
             res = generate_test_cases_with_logging(code_text)
-        st.success(f"Status: {res['status']} — {res.get('reason','')}")
-        st.session_state["tests"] = "\n".join(res["tests"])
-        st.text_area("Generated Test Cases (Editable)", st.session_state["tests"], height=200)
-
+            st.success(f"Status: {res['status']} — {res.get('reason','')}")
+            st.session_state["tests"] = "\n".join(res["tests"])
+            st.text_area("Generated Test Cases (Editable)", st.session_state["tests"], height=200)
 # ---------------- Evaluation ----------------
-st.header("2️⃣ Run Evaluation and Generate Report")
-if st.button("🏁 Run Evaluation"):
+st.header("2️ ⃣  Run Evaluation and Generate Report")
+if st.button(" 🏁  Run Evaluation"):
     if not code_text or not code_text.strip():
         st.warning("Please provide a valid C program first.")
     else:
         # Split layout: Left = Evaluation, Right = Report
         left, right = st.columns([0.55, 0.45])
-
         # ---------- LEFT PANEL: Evaluation ----------
         with left:
             with st.spinner("Running compilation, static analysis, and tests..."):
@@ -70,85 +66,82 @@ if st.button("🏁 Run Evaluation"):
                     st.session_state.get("tests", "").splitlines(),
                     llm_reporter=llm_agents.generate_llm_report,
                 )
-
             compile_info = evaluation.get("compile", {})
             static_info = evaluation.get("static", {})
             test_info = evaluation.get("test", {}).get("results", [])
             perf_info = evaluation.get("perf", {})
             final_score = evaluation.get("final_score", 0)
+            # The score breakdown weights are advertised as (20/20/50/10) 
             score_breakdown = evaluation.get("score_breakdown", {
                 "Compilation": 20,
                 "Static Analysis": 20,
                 "Functional": 50,
                 "Performance": 10
             })
-
-            st.success("✅ Evaluation Completed")
-
+            st.success(" ✅  Evaluation Completed")
             # Compilation summary
-            st.markdown("### 🧱 Compilation")
+            st.markdown("###  🧱  Compilation")
             if compile_info.get("status") == "success":
-                st.write("✅ Code compiled successfully using GCC.")
+                st.write(" ✅  Code compiled successfully using GCC.")
             else:
-                st.error(f"❌ Compilation failed:\n\n{compile_info.get('stderr', 'No message available.')}")
-
+                st.error(f" ❌  Compilation failed:\n\n{compile_info.get('stderr', 'No message available.')}")
             # Static analysis
-            st.markdown("### 🧩 Static Analysis (Cppcheck)")
+            st.markdown("###  🧩  Static Analysis (Cppcheck)")
             issues = static_info.get("issues", [])
             if issues:
                 st.warning(f"{len(issues)} issue(s) found:")
                 for issue in issues:
                     st.write(f"• {issue}")
             else:
-                st.write("✅ No static issues detected.")
-
+                st.write(" ✅  No static issues detected.")
             # Test results
-            st.markdown("### 🧪 Functional Testing")
+            st.markdown("###  🧪  Functional Testing")
             if not test_info:
                 st.info("No test cases executed.")
             else:
                 total = len(test_info)
                 passed = sum(1 for t in test_info if t["success"])
-                st.write(f"📊 **{passed}/{total} Tests Passed**")
+                st.write(f" 📊  **{passed}/{total} Tests Passed**")
                 for i, t in enumerate(test_info, 1):
                     st.markdown(
-                        f"**Test {i}:**  \n"
-                        f"🧮 Input: `{t['input']}`  \n"
-                        f"🎯 Expected: `{t['expected']}`  \n"
-                        f"💻 Actual: `{t['actual']}`  \n"
-                        f"✅ Result: {'Passed' if t['success'] else 'Failed'}  \n"
-                        f"💬 Comment: {t['comment']}"
+                        f"**Test {i}:** \n"
+                        f" 🧮  Input: `{t['input']}`  \n"
+                        f" 🎯  Expected: `{t['expected']}`  \n"
+                        f" 💻  Actual: `{t['actual']}`  \n"
+                        f" ✅  Result: {'Passed' if t['success'] else 'Failed'}  \n"
+                        f" 💬  Comment: {t['comment']}"
                     )
-                    st.divider()
-
+                st.divider()
             # Performance
-            st.markdown("### ⚙️ Performance")
+            st.markdown("###  ⚙ ️ Performance")
             st.write(perf_info.get("comment", "Performance not recorded."))
-
             # Score breakdown
-            st.markdown("### 🧮 Score Breakdown")
-            st.write(f"**Compilation:** {score_breakdown.get('Compilation', 0)}/20")
-            st.write(f"**Static Analysis:** {score_breakdown.get('Static Analysis', 0)}/20")
-            st.write(f"**Functional Testing:** {score_breakdown.get('Functional', 0)}/50")
-            st.write(f"**Performance:** {score_breakdown.get('Performance', 0)}/10")
-
-            st.metric(label="🏆 Final Score", value=f"{final_score} / 100")
-
+            st.markdown("###  🧮  Score Breakdown")
+            st.write(f"**Compilation:** {evaluation.get('score_breakdown', {}).get('Compilation', 0)}/{score_breakdown.get('Compilation', 20)}")
+            st.write(f"**Static Analysis:** {evaluation.get('score_breakdown', {}).get('Static Analysis', 0)}/{score_breakdown.get('Static Analysis', 20)}")
+            st.write(f"**Functional Testing:** {evaluation.get('score_breakdown', {}).get('Functional', 0)}/{score_breakdown.get('Functional', 50)}")
+            st.write(f"**Performance:** {evaluation.get('score_breakdown', {}).get('Performance', 0)}/{score_breakdown.get('Performance', 10)}")
+            st.metric(label=" 🏆  Final Score", value=f"{final_score} / 100")
         # ---------- RIGHT PANEL: Gemini Report ----------
         with right:
-            st.markdown("### 📘 Gemini 2.5 Flash Report")
-
+            st.markdown("###  📘  Gemini 2.5 Flash Report")
             # Try Gemini normally first
             report_text = None
             try:
                 with st.spinner("Generating student-friendly report (Gemini 2.5 Flash)..."):
+                    # Note: We rely on run_grader_pipeline to pass the right llm_reporter.
+                    # This call is redundant here, as the report is already generated 
+                    # by the run_grader_pipeline and available in the `evaluation` dict
+                    # if we were not using the LangGraph structure. 
+                    # For a clean separation, we keep the report generation here, 
+                    # or better, rely on the evaluation object from the pipeline.
+                    # Since run_grader_pipeline *returns* the report_text, we should check there.
+                    # Reverting to the original App.py logic for local generation:
                     report_text = llm_agents.generate_llm_report(evaluation)
             except Exception as e:
                 logger.warning(f"Gemini report generation failed: {e}")
-
             def is_valid_report(text):
                 return bool(text) and isinstance(text, str) and len(text.strip()) > 60
-
             # Retry if report is too short or missing
             if not is_valid_report(report_text):
                 logger.info("Primary Gemini report empty — retrying with explicit simple-language prompt.")
@@ -168,7 +161,6 @@ if st.button("🏁 Run Evaluation"):
                 except Exception as e:
                     logger.warning(f"Gemini retry failed: {e}")
                     report_text = None
-
             # Final fallback if still empty
             if not is_valid_report(report_text):
                 logger.warning("Gemini report unavailable after retry — using fallback summary.")
@@ -177,8 +169,8 @@ if st.button("🏁 Run Evaluation"):
                     fallback_lines.append("Compilation: Your program compiled successfully.")
                 else:
                     fallback_lines.append("Compilation: Your program failed to compile. Please fix syntax errors.")
-                    if compile_info.get("stderr"):
-                        fallback_lines.append(f"Compiler output: {compile_info.get('stderr')}")
+                if compile_info.get("stderr"):
+                    fallback_lines.append(f"Compiler output: {compile_info.get('stderr')}")
                 if static_info.get("issues"):
                     fallback_lines.append(f"Static Analysis: {len(static_info.get('issues'))} issue(s) found.")
                     for it in static_info.get("issues")[:3]:
@@ -196,25 +188,22 @@ if st.button("🏁 Run Evaluation"):
                     fallback_lines.append(f"Performance: {perf_comment}")
                 fallback_lines.append(f"Overall Score: {final_score}/100.")
                 report_text = "\n\n".join(fallback_lines)
-
             # Safe HTML conversion (fixed syntax)
             safe_html = report_text.replace("\n", "<br/>")
-
             # Display as styled non-editable section
             st.markdown(
                 f"""
                 <div style="
-                    background-color: #fbfbfb;
-                    padding: 16px;
-                    border-radius: 12px;
-                    border: 1px solid #e2e2e2;
-                    color: #111;">
-                    {safe_html}
+                background-color: #fbfbfb;
+                padding: 16px;
+                border-radius: 12px;
+                border: 1px solid #e2e2e2;
+                color: #111;">
+                {safe_html}
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-
             # -------- PDF Generation --------
             def generate_pdf(report: str) -> BytesIO:
                 buffer = BytesIO()
@@ -232,15 +221,12 @@ if st.button("🏁 Run Evaluation"):
                 doc.build(story)
                 buffer.seek(0)
                 return buffer
-
             pdf_bytes = generate_pdf(report_text)
             st.download_button(
-                "📥 Download Report (PDF)",
+                " 📥  Download Report (PDF)",
                 data=pdf_bytes,
                 file_name="C_Autograder_Report.pdf",
                 mime="application/pdf",
                 use_container_width=True,
             )
-
             st.caption("If Gemini output was limited, a retry or fallback summary was generated to ensure full feedback.")
-
