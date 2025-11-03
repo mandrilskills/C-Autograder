@@ -3,3 +3,4 @@ reportlab==4.2.2
 google-generativeai==0.8.3
 langgraph
 python-dotenv==1.0.1
+langchain-google-genai==0.1.6
