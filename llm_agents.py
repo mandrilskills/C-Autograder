@@ -9,15 +9,37 @@ from reportlab.pdfgen import canvas
 # ---------------- Gemini 2.5 Flash Configuration ---------------- #
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-def call_gemini(prompt, system_message=None, timeout=30):
-    """Safely call Gemini 2.5 Flash with timeout and graceful failure."""
+def call_gemini(prompt, timeout=30):
+    """Safely call Gemini 2.5 Flash with content extraction."""
     try:
         model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(prompt, request_options={"timeout": timeout})
-        return response.text
+        response = model.generate_content(
+            prompt,
+            request_options={"timeout": timeout},
+            generation_config={
+                "temperature": 0.4,
+                "max_output_tokens": 2048,
+            },
+        )
+
+        # --- Safely extract text ---
+        if hasattr(response, "text") and response.text:
+            return response.text.strip()
+
+        # Newer SDK: sometimes only .candidates exist
+        if hasattr(response, "candidates") and response.candidates:
+            parts = response.candidates[0].content.parts
+            if parts and hasattr(parts[0], "text"):
+                return parts[0].text.strip()
+
+        # If no text at all
+        st.warning("⚠️ Gemini 2.5 Flash returned no textual output.")
+        return None
+
     except Exception as e:
         st.error(f"Gemini 2.5 Flash call failed: {e}")
         return None
+
 
 
 # ---------------- Generate Test Cases ---------------- #
