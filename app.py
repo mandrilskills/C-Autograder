@@ -1,139 +1,94 @@
-# app.py
-"""
-Streamlit UI for the C Autograder
-
-- Upload or paste a C program.
-- Optionally auto-generate test cases with an LLM.
-- Run compilation, static analysis (cppcheck), tests, and performance using grader agents.
-- Orchestrate results into JSON, then ask Gemini (LLM) to create a detailed textual report
-  based on that JSON (LLM is only used for writing the report — not for evaluation).
-- Provide a downloadable PDF containing the LLM-written report and grader JSON summary.
-"""
-
+# app.py (Updated Test Case Handling)
 import streamlit as st
-from typing import List
-import logging
-
 import grader_langgraph as grader
 import llm_agents
+import logging
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="C Autograder", layout="wide")
 st.title("C Autograder (Agentic System)")
 
-st.markdown(
-    """
-**Security warning:** this demo compiles & runs untrusted C code locally.
-For production, run each submission inside a secure sandbox (Docker, container runtime, VM).
-"""
-)
+st.markdown("""
+### Upload or paste your C code
+You can manually provide test cases or let Gemini (LLM) auto-generate them.
+After generation, you can review or edit the cases before evaluation.
+""")
 
-# Sidebar options
-with st.sidebar:
-    st.header("Options")
-    show_raw = st.checkbox("Show raw evaluation JSON", value=False)
-    use_llm_for_tests = st.checkbox("Auto-generate test cases using LLM", value=False)
-    generate_llm_report = st.checkbox("Use LLM to write final report (recommended)", value=True)
-    max_tests = st.number_input("Max auto test cases", min_value=1, max_value=20, value=6)
+uploaded = st.file_uploader("Upload `.c` file", type=["c", "txt"])
+code_text = uploaded.read().decode("utf-8") if uploaded else ""
 
-# Upload or paste code
-st.header("Submit C Source Code")
-uploaded = st.file_uploader("Upload `.c` file or paste your code", type=["c", "txt"])
-code_text = ""
-if uploaded is not None:
-    try:
-        code_text = uploaded.read().decode("utf-8")
-    except Exception:
-        code_text = str(uploaded.getvalue())
+code_text_area = st.text_area("Paste or edit your C code here:", code_text, height=300)
 
-code_text_area = st.text_area("Paste or edit your C code here", value=code_text, height=300)
+# Options
+use_llm_for_tests = st.checkbox("Auto-generate test cases using LLM (Gemini 2.5 Flash)", value=False)
+generate_llm_report = st.checkbox("Generate detailed LLM report after evaluation", value=True)
 
-st.markdown("---")
-st.header("Test cases (one per line) — format: input::expected_output")
+# --- Step 1: Generate test cases ---
+if st.button("Generate Test Cases via LLM") and code_text_area.strip():
+    with st.spinner("Generating test cases using Gemini..."):
+        generated_tests = llm_agents.generate_test_cases(code_text_area)
+        if generated_tests:
+            st.session_state["auto_tests"] = "\n".join(generated_tests)
+            st.success(f"✅ {len(generated_tests)} test cases generated successfully.")
+        else:
+            st.warning("⚠️ Gemini could not generate test cases. Please enter manually.")
+
+# --- Step 2: Let user review / edit test cases ---
+default_tests = st.session_state.get("auto_tests", "")
 tests_text = st.text_area(
-    "Provide test cases manually (leave blank to auto-generate via LLM if option enabled).",
-    value="",
-    height=140,
+    "Review / edit test cases (one per line in format input::expected_output):",
+    value=default_tests,
+    height=160,
 )
 
-run_btn = st.button("Run Autograder")
-
-def parse_tests_from_text(t: str) -> List[str]:
-    return [line.strip() for line in t.splitlines() if line.strip()]
-
-if run_btn:
+# --- Step 3: Run grading pipeline ---
+if st.button("Run Evaluation"):
     code_to_grade = code_text_area.strip()
     if not code_to_grade:
-        st.error("Please provide C source code to evaluate.")
+        st.error("Please provide your C source code.")
     else:
-        st.info("Starting grading pipeline...")
+        test_cases = [t.strip() for t in tests_text.splitlines() if "::" in t]
+        if not test_cases:
+            st.warning("No valid test cases found. Compilation and static analysis will still be performed.")
 
-        # 1) Prepare tests
-        tests_list = parse_tests_from_text(tests_text)
-        if not tests_list and use_llm_for_tests:
-            st.info("Generating test cases using LLM...")
-            generated = llm_agents.generate_test_cases(code_to_grade)
-            if generated:
-                tests_list = generated[:max_tests]
-                st.success(f"Generated {len(tests_list)} test cases using LLM.")
-            else:
-                st.warning("LLM could not produce test cases. Please enter them manually.")
-
-        if not tests_list:
-            st.warning("No test cases provided. The grader will still run compilation & static analysis.")
-
-        # 2) Run grader pipeline (LLM reporter passed but reported LLM will only produce report text)
+        st.info("Running grader agents (gcc, cppcheck, execution)...")
         try:
             llm_reporter = llm_agents.generate_detailed_report if generate_llm_report else None
-            results = grader.run_grader_pipeline(code_to_grade, tests=tests_list, llm_reporter=llm_reporter)
+            results = grader.run_grader_pipeline(code_to_grade, test_cases, llm_reporter=llm_reporter)
 
-            if show_raw:
-                st.subheader("Raw evaluation JSON")
-                st.json(results)
-
+            # --- Display Evaluation Summary ---
             st.subheader("Evaluation Summary")
-            if results.get("error"):
-                st.error(f"Pipeline error: {results.get('error')}")
+            st.metric("Final Score", f"{results.get('final_score', 0)} / 100")
+
+            st.markdown("### 🧪 Test Case Results")
+            for i, t in enumerate(results.get("test", {}).get("results", []), start=1):
+                status = "✅ PASS" if t["success"] else "❌ FAIL"
+                st.write(f"**Test {i}:** `{t['input']}` → expected `{t['expected']}` | got `{t['actual']}` | {status}")
+
+            st.markdown("### 🧰 Static Analysis")
+            st.json(results.get("static", {}))
+
+            st.markdown("### ⚙️ Compilation Output")
+            st.text(results.get("compile", {}).get("stderr", "") or "Compiled successfully.")
+
+            st.markdown("### 🚀 Performance")
+            st.json(results.get("perf", {}))
+
+            if results.get("report"):
+                st.markdown("### 🧾 LLM-Generated Detailed Report")
+                st.markdown(results["report"].replace("\n", "<br/>"), unsafe_allow_html=True)
             else:
-                st.metric("Final Score", f"{results.get('final_score', 0)} / 100")
-                st.markdown("### LLM-written Report (if available)")
-                report_text = results.get("report") or "No report generated."
-                # report_text may contain newlines; display as markdown
-                st.markdown(report_text.replace("\n", "<br/>"), unsafe_allow_html=True)
+                st.warning("No LLM report generated.")
 
-                # Downloadable PDF
-                pdf_bytes = results.get("pdf_bytes")
-                if pdf_bytes:
-                    st.download_button(
-                        "Download Full Report (PDF)",
-                        data=pdf_bytes,
-                        file_name="C_Grading_Report.pdf",
-                        mime="application/pdf",
-                    )
-
-                st.markdown("### Compilation output")
-                st.write(results.get("compile", {}))
-
-                st.markdown("### Static analysis (cppcheck / heuristics)")
-                st.write(results.get("static", {}))
-
-                st.markdown("### Test case results")
-                st.write(results.get("test", {}))
-                if results.get("test", {}).get("results"):
-                    with st.expander("Detailed test results"):
-                        for idx, t in enumerate(results["test"]["results"], start=1):
-                            st.write(f"Test #{idx}:")
-                            st.json(t)
-
-                st.markdown("### Performance")
-                st.write(results.get("perf", {}))
-
-                st.success("Evaluation completed. Temporary files cleaned up.")
+            if results.get("pdf_bytes"):
+                st.download_button(
+                    "📄 Download Full Report (PDF)",
+                    data=results["pdf_bytes"],
+                    file_name="C_Autograder_Report.pdf",
+                    mime="application/pdf",
+                )
 
         except Exception as e:
-            st.error(f"Grading pipeline failed: {e}")
-            logger.exception("Grader pipeline exception")
-
-st.caption("© 2025 C Autograder — Use sandboxing for production.")
+            st.error(f"Pipeline failed: {e}")
+            logger.exception("Evaluation error")
