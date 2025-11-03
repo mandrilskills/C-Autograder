@@ -1,169 +1,324 @@
-import time
-import os
+"""
+grader_langgraph.py
+
+A small grader pipeline that:
+- defines a GraderState Pydantic model
+- provides agents (compile, static analysis, run tests, performance)
+- orchestrates calls and returns a final dict.
+
+IMPORTANT SECURITY NOTE:
+- The compile_and_run functions in this file run the submitted C code using subprocess.
+  This is UNSAFE on an unprotected host. For production, run student code inside a sandbox
+  (Docker container, firejail, gVisor, etc.). The example below uses a simple, limited
+  subprocess approach for convenience/testing only.
+"""
+
+from typing import Dict, Any, Optional, List, Tuple
+from pydantic import BaseModel
+import tempfile
 import subprocess
-import json
-from typing import List, Annotated, Dict, Any, Optional
+import os
+import shutil
+import time
+import logging
 
-from pydantic import BaseModel, Field
-from langchain_core.messages import BaseMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolExecutor, ToolInvocation
-from langgraph.channels.base import BaseChannel
-from langgraph.channels.last_value import LastValue
-from langgraph.graph.graph import make_sync
-from langchain_core.pydantic_v1 import BaseModel as PydanticBaseModel
-
-# --- Configuration (Assumed from typical setup) ---
-# NOTE: Replace with your actual Gemini model if needed
-# The actual LLM setup might be elsewhere, but we include it for completeness
-try:
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.0)
-except Exception:
-    # Placeholder if the user's environment handles LLM initialization externally
-    pass
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
-# --- 1. State Definition (Inferred to contain conflicting field names) ---
-class GraderState(PydanticBaseModel):
-    """Represents the state of the C-Autograder pipeline."""
-    code_text: str = Field(description="The submitted C code.")
-    tests: str = Field(description="The test cases/input expected output.")
+class GraderState(BaseModel):
+    # Inputs
+    code: str
+    tests: List[str] = []
 
-    # These fields must NOT have the same name as the graph nodes
-    compile: Optional[dict] = Field(description="Result of compilation step.")
-    static: Optional[dict] = Field(description="Result of static analysis step.")
-    test: Optional[dict] = Field(description="Result of test execution step.")
-    perf: Optional[dict] = Field(description="Result of performance analysis step.")
+    # Intermediate / outputs
+    compile: Optional[Dict[str, Any]] = None
+    static: Optional[Dict[str, Any]] = None
+    test: Optional[Dict[str, Any]] = None
+    perf: Optional[Dict[str, Any]] = None
 
-    # Final combined report and score
-    report: str = Field(default="", description="The full grading report text.")
-    final_score: float = Field(default=0.0, description="The final calculated score.")
-
-    # Internal tracking
-    submission_id: str = Field(description="Unique ID for the submission.")
-    messages: List[BaseMessage] = Field(default_factory=list, description="Conversation history for agents.")
+    # Final
+    report: Optional[str] = None
+    final_score: Optional[float] = None
+    messages: Optional[List[Dict[str, Any]]] = None
 
 
-# --- 2. Agent Definitions (Placeholders - user's logic is preserved) ---
+###############################################################################
+# Utility: compile code in a temporary directory
+###############################################################################
+def compile_c_code(code_text: str, timeout_seconds: int = 10) -> Dict[str, Any]:
+    """
+    Compile C code with gcc in a temporary directory.
 
-def compile_agent(state: GraderState) -> GraderState:
-    """Agent for compiling the C code."""
-    # This function is assumed to contain the actual compilation logic
-    print("Agent: Compiling code...")
-    # NOTE: The actual compilation logic needs to be here. 
-    # For a placeholder, we simulate success.
-    # The actual implementation should update the 'compile' key in the state.
-    
-    # Placeholder for actual C compilation logic using subprocess.run('gcc ...')
-    # ...
-    
-    return {"compile": {"status": "success", "output": "Mock compilation output.", "logs": ""}}
+    Returns dict:
+      {
+        "status": "success"|"error",
+        "binary_path": "/tmp/...",
+        "stdout": "...",
+        "stderr": "...",
+        "returncode": 0
+      }
 
-def static_agent(state: GraderState) -> GraderState:
-    """Agent for running static analysis (e.g., cppcheck)."""
-    print("Agent: Running static analysis...")
-    return {"static": {"status": "success", "report": "Mock static analysis report."}}
+    WARNING: Running untrusted code on the host is unsafe. Use sandboxing in production.
+    """
+    result = {"status": "error", "binary_path": None, "stdout": "", "stderr": "", "returncode": None}
+    tmpdir = tempfile.mkdtemp(prefix="grader_compile_")
+    src_path = os.path.join(tmpdir, "submission.c")
+    bin_path = os.path.join(tmpdir, "submission_bin")
+    try:
+        with open(src_path, "w", encoding="utf-8") as f:
+            f.write(code_text)
 
-def test_agent(state: GraderState) -> GraderState:
-    """Agent for running functional tests against the compiled binary."""
-    print("Agent: Running functional tests...")
-    return {"test": {"status": "success", "results": "Mock test results."}}
+        # run gcc
+        proc = subprocess.run(["gcc", src_path, "-o", bin_path], capture_output=True, text=True, timeout=timeout_seconds)
+        result["stdout"] = proc.stdout or ""
+        result["stderr"] = proc.stderr or ""
+        result["returncode"] = proc.returncode
+        if proc.returncode == 0 and os.path.exists(bin_path):
+            result["status"] = "success"
+            result["binary_path"] = bin_path
+        else:
+            result["status"] = "error"
+    except subprocess.TimeoutExpired as te:
+        result["stderr"] = f"Compilation timed out after {timeout_seconds}s."
+        result["returncode"] = -1
+        result["status"] = "error"
+    except Exception as e:
+        result["stderr"] = str(e)
+        result["status"] = "error"
+    # We intentionally don't delete tmpdir: caller should remove binary when done (for safety)
+    return result
 
-def performance_agent(state: GraderState) -> GraderState:
-    """Agent for running performance/memory checks (e.g., time/valgrind)."""
-    print("Agent: Running performance checks...")
-    return {"perf": {"status": "success", "metrics": "Mock performance metrics."}}
 
-def orchestrate(state: GraderState) -> GraderState:
-    """LLM agent to combine all results and generate the final report and score."""
-    print("Agent: Orchestrating feedback and scoring...")
-    
-    # Placeholder for LLM call logic
-    mock_llm_report = (
-        "## Grading Report\n"
-        "### Compilation: Success\n"
-        "### Static Analysis: Minor warnings found.\n"
-        "### Functional Tests: 3/5 tests passed.\n"
-        "### Performance: Good time complexity, low memory usage.\n"
-        "---"
-    )
-    mock_score = 75.0
+def run_binary_with_input(bin_path: str, input_data: str, timeout_seconds: int = 3) -> Dict[str, Any]:
+    """
+    Run the compiled binary with given input_data (string), returning stdout/stderr/rc/time.
+    """
+    result = {"stdout": "", "stderr": "", "returncode": None, "time": None}
+    if not os.path.exists(bin_path) or not os.access(bin_path, os.X_OK):
+        result["stderr"] = "Binary not found or not executable."
+        return result
 
-    return {
-        "report": mock_llm_report,
-        "final_score": mock_score,
-        "messages": [BaseMessage(content="Orchestration complete.", type="ai")]
+    start = time.time()
+    try:
+        proc = subprocess.run([bin_path], input=input_data, capture_output=True, text=True, timeout=timeout_seconds)
+        elapsed = time.time() - start
+        result["stdout"] = proc.stdout or ""
+        result["stderr"] = proc.stderr or ""
+        result["returncode"] = proc.returncode
+        result["time"] = elapsed
+    except subprocess.TimeoutExpired:
+        result["stderr"] = f"Execution timed out after {timeout_seconds}s."
+        result["returncode"] = -1
+        result["time"] = timeout_seconds
+    except Exception as e:
+        result["stderr"] = str(e)
+        result["returncode"] = -1
+        result["time"] = None
+    return result
+
+
+###############################################################################
+# Agents
+###############################################################################
+def compile_agent(state: GraderState) -> Dict[str, Any]:
+    """
+    Compile the submitted code and update state.
+    Returns a dict with the key 'compile' to be merged into the state.
+    """
+    logger.info("compile_agent: compiling code...")
+    compile_res = compile_c_code(state.code, timeout_seconds=12)
+    # If compile succeeded, leave binary path in compile output (caller should cleanup)
+    return {"compile": compile_res}
+
+
+def static_agent(state: GraderState) -> Dict[str, Any]:
+    """
+    Very simple static analysis: check for use of forbidden functions (e.g., system),
+    presence of main, and approximate length. For production, plug in clang-tidy or cppcheck.
+    """
+    logger.info("static_agent: running simple static checks...")
+    code = state.code or ""
+    issues = []
+    if "system(" in code:
+        issues.append("Use of system(...) detected — disallowed in grading environment.")
+    if "gets(" in code:
+        issues.append("Use of gets(...) detected — unsafe function.")
+    if "main(" not in code:
+        issues.append("No main() found; program may not be runnable.")
+    length = len(code.splitlines())
+    summary = {"issues": issues, "lines": length}
+    return {"static": summary}
+
+
+def test_agent(state: GraderState) -> Dict[str, Any]:
+    """
+    Run functional tests provided in state.tests.
+    Each test string is expected to be of the form 'input::expected_output' (best-effort).
+    Returns a dict with test results and counts.
+    """
+    logger.info("test_agent: running functional tests...")
+    compile_info = state.compile or {}
+    if compile_info.get("status") != "success" or not compile_info.get("binary_path"):
+        return {"test": {"status": "skipped", "reason": "Compilation failed or binary missing", "results": []}}
+
+    bin_path = compile_info["binary_path"]
+    results = []
+    passed = 0
+    total = len(state.tests or [])
+    for t in state.tests or []:
+        input_part, expected = "", ""
+        if "::" in t:
+            input_part, expected = t.split("::", 1)
+        elif "->" in t:
+            input_part, expected = t.split("->", 1)
+        else:
+            input_part, expected = t, ""
+
+        input_str = input_part.strip()
+        expected_str = expected.strip()
+
+        exec_res = run_binary_with_input(bin_path, input_str, timeout_seconds=2)
+        out = (exec_res.get("stdout") or "").strip()
+        passed_now = False
+        # Conservative comparison: strip and compare
+        if expected_str == "":
+            # If no expected provided, mark as 'ran' but not pass/fail
+            outcome = {"input": input_str, "expected": expected_str, "output": out, "pass": None, "meta": exec_res}
+        else:
+            pass_flag = (out == expected_str)
+            if pass_flag:
+                passed += 1
+            outcome = {"input": input_str, "expected": expected_str, "output": out, "pass": pass_flag, "meta": exec_res}
+        results.append(outcome)
+
+    score = None
+    if total > 0:
+        score = round((passed / total) * 100.0, 2)
+    return {"test": {"status": "done", "results": results, "passed": passed, "total": total, "score": score}}
+
+
+def performance_agent(state: GraderState) -> Dict[str, Any]:
+    """
+    Simple perf checks: average runtime across tests and mark if any test timed out.
+    """
+    logger.info("performance_agent: measuring performance...")
+    test_info = state.test or {}
+    results = test_info.get("results", [])
+    times = []
+    timed_out = False
+    for r in results:
+        meta = r.get("meta", {}) or {}
+        t = meta.get("time")
+        if t is not None:
+            times.append(t)
+        if meta.get("returncode") == -1 and "timed out" in (meta.get("stderr") or ""):
+            timed_out = True
+
+    avg = sum(times) / len(times) if times else None
+    perf_summary = {"average_time": avg, "any_timeouts": timed_out}
+    return {"perf": perf_summary}
+
+
+def orchestrate(state: GraderState, llm_reporter=None) -> Dict[str, Any]:
+    """
+    Final orchestration: compute a final score (weighted), ask LLM for a text report
+    (if llm_reporter provided), and return report + final_score.
+    llm_reporter is expected to be a callable that accepts a context dict and returns a string.
+    """
+    logger.info("orchestrate: computing final score and report...")
+    # Combine scores: compile pass gives base points, tests give majority, perf small bonus
+    compile_ok = 1 if (state.compile or {}).get("status") == "success" else 0
+    test_info = state.test or {}
+    test_score = test_info.get("score")
+    perf_info = state.perf or {}
+    perf_bonus = 5.0 if not perf_info.get("any_timeouts", False) else 0.0
+
+    computed_score = 0.0
+    if test_score is not None:
+        # Weighted: tests 85%, compile 10%, perf 5%
+        computed_score = round((0.85 * test_score) + (0.10 * (100.0 if compile_ok else 0.0)) + (0.05 * perf_bonus), 2)
+    else:
+        # fallback: 50 if compiled else 0
+        computed_score = 50.0 if compile_ok else 0.0
+
+    context = {
+        "code": state.code,
+        "compile": state.compile,
+        "static": state.static,
+        "test": state.test,
+        "perf": state.perf,
+        "score": computed_score,
     }
 
-# --- 3. Graph Construction (Fix applied here) ---
+    report_text = None
+    if llm_reporter:
+        try:
+            report_text = llm_reporter(context)
+        except Exception as e:
+            logger.exception("LLM reporter failed: %s", e)
+            report_text = None
 
-def build_grader_graph():
+    # Basic textual fallback report if LLM not available
+    if not report_text:
+        lines = [
+            "## Automated Grading Report (fallback)",
+            f"Final score: {computed_score}",
+            "",
+            "### Compilation",
+            str(state.compile),
+            "",
+            "### Static Analysis",
+            str(state.static),
+            "",
+            "### Tests",
+            str(state.test),
+            "",
+            "### Performance",
+            str(state.perf),
+        ]
+        report_text = "\n".join(lines)
+
+    return {"report": report_text, "final_score": float(computed_score), "messages": [{"type": "system", "content": "orchestration complete"}]}
+
+
+###############################################################################
+# Pipeline runner
+###############################################################################
+def run_grader_pipeline(code_text: str, tests: Optional[List[str]] = None, llm_reporter=None) -> Dict[str, Any]:
     """
-    Builds the LangGraph StateGraph for the C-Autograder pipeline.
+    Runs the pipeline in sequence:
+      - compile
+      - static
+      - test
+      - perf
+      - orchestrate (final)
 
-    FIX: Node names are now suffixed with '_node' to prevent conflicts with 
-    the keys in GraderState (e.g., 'compile', 'static'), resolving the ValueError.
+    Returns a plain dict suitable for serialization (JSON).
     """
-    g = StateGraph(GraderState)
+    state = GraderState(code=code_text, tests=tests or [])
+    try:
+        # compile
+        compile_out = compile_agent(state)
+        state.compile = compile_out.get("compile")
+        # static
+        static_out = static_agent(state)
+        state.static = static_out.get("static")
+        # tests
+        test_out = test_agent(state)
+        state.test = test_out.get("test")
+        # perf
+        perf_out = performance_agent(state)
+        state.perf = perf_out.get("perf")
+        # orchestrate
+        orch_out = orchestrate(state, llm_reporter=llm_reporter)
+        state.report = orch_out.get("report")
+        state.final_score = orch_out.get("final_score")
+        state.messages = orch_out.get("messages")
+    except Exception as e:
+        logger.exception("Pipeline failed: %s", e)
+        # return partial state with error info
+        return {"error": str(e), **state.dict()}
 
-    # Renamed nodes to prevent conflict with state keys in GraderState
-    g.add_node("compile_node", make_sync(compile_agent))
-    g.add_node("static_node", make_sync(static_agent))
-    g.add_node("test_node", make_sync(test_agent))
-    g.add_node("perf_node", make_sync(performance_agent))
-    g.add_node("orchestrate_node", make_sync(orchestrate))
-
-    # Graph flow: compile -> static -> test -> perf -> orchestrate -> END
-
-    # 1. Set Entry Point
-    g.set_entry_point("compile_node")
-
-    # 2. Add Edges (sequential flow assumed)
-    g.add_edge("compile_node", "static_node")
-    g.add_edge("static_node", "test_node")
-    g.add_edge("test_node", "perf_node")
-    g.add_edge("perf_node", "orchestrate_node")
-
-    # 3. Set Finish Point
-    g.add_edge("orchestrate_node", END)
-
-    return g.compile()
-
-
-def run_grader_pipeline(code_text: str, tests: str) -> Dict[str, Any]:
-    """
-    Runs the entire grading pipeline using the LangGraph state machine.
-
-    Args:
-        code_text: The submitted C code content.
-        tests: The test cases/input.
-
-    Returns:
-        The structured feedback dictionary from the feedback agent.
-    """
-    # This is line 263 which was causing the error due to graph build failure
-    graph = build_grader_graph()
-
-    submission_id = str(time.time()).replace(".", "") # Unique ID for tracing
-
-    config = {
-        "configurable": {
-            "submission_id": submission_id,
-        }
-    }
-
-    # Initial state to pass to the graph
-    initial_state = GraderState(
-        code_text=code_text,
-        tests=tests,
-        report="Starting...",
-        submission_id=submission_id
-    )
-
-    # Run the graph and get the final state
-    final_state = graph.invoke(initial_state, config=config)
-
-    # Return the dictionary representation of the final state
-    return final_state
+    # Convert to dict for UI consumption
+    return state.dict()
