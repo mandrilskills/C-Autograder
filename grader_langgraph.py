@@ -238,14 +238,16 @@ def feedback(result: GraderState):
 
 def build_grader_graph():
     g = StateGraph(GraderState)
-    g.add_node("compile", make_sync(compile_agent))
+    # RENAME: Renamed 'compile' node to 'run_compile' to avoid conflict with the 'compile' state key.
+    g.add_node("run_compile", make_sync(compile_agent))
     g.add_node("static", make_sync(static_agent))
     g.add_node("test", make_sync(test_agent))
     g.add_node("perf", make_sync(performance_agent))
     g.add_node("orchestrate", make_sync(orchestrate))
 
-    g.set_entry_point("compile")
-    g.add_edge("compile", "static")
+    # Updated entry point and edges to use the new node name
+    g.set_entry_point("run_compile")
+    g.add_edge("run_compile", "static")
     g.add_edge("static", "test")
     g.add_edge("test", "perf")
     g.add_edge("perf", "orchestrate")
