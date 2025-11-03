@@ -28,23 +28,23 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------
-# CUSTOM DARK THEME STYLING (MAGENTA–BLACK GRADIENT)
+# STYLING – MODERN DARK NEON BLUE THEME
 # ---------------------------------------------------------------------
 st.markdown("""
 <style>
     html, body, .main {
-        background: linear-gradient(135deg, #0a0014 0%, #1a0b1f 40%, #2b0034 100%);
-        color: #f5f5f7;
+        background: linear-gradient(135deg, #0a0f1f 0%, #0d1628 50%, #111a2f 100%);
+        color: #e2e8f0;
         font-family: 'Inter', sans-serif;
     }
     h1, h2, h3 {
-        color: #ff4fc3;
+        color: #6ecbff;
         font-weight: 600;
-        letter-spacing: 0.5px;
+        letter-spacing: 0.3px;
     }
     .stButton>button {
-        background-color: #ff4fc3;
-        color: #fff;
+        background-color: #2563eb;
+        color: #f8fafc;
         border: none;
         border-radius: 8px;
         font-weight: 600;
@@ -52,39 +52,39 @@ st.markdown("""
         transition: 0.3s ease-in-out;
     }
     .stButton>button:hover {
-        background-color: #ff1da2;
+        background-color: #1e40af;
         transform: scale(1.03);
     }
     .section-card {
-        background: rgba(15, 15, 20, 0.7);
-        border: 1px solid #2e0b33;
+        background: rgba(20, 25, 35, 0.7);
+        border: 1px solid #1f2a40;
         border-radius: 12px;
         padding: 22px 28px;
-        box-shadow: 0 4px 12px rgba(0,0,0,0.6);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.4);
         margin-bottom: 30px;
-        backdrop-filter: blur(12px);
+        backdrop-filter: blur(10px);
     }
     .report-box {
-        background: rgba(20, 10, 20, 0.85);
-        border: 1px solid #3a1040;
+        background: rgba(15, 20, 35, 0.85);
+        border: 1px solid #1d2a4f;
         border-radius: 10px;
         padding: 16px;
-        color: #f2e6f5;
+        color: #d9e2f1;
     }
     .stTextInput>div>div>input, textarea {
-        background-color: rgba(30, 10, 35, 0.85) !important;
-        color: #f5f5f7 !important;
+        background-color: rgba(25, 30, 45, 0.85) !important;
+        color: #e2e8f0 !important;
         border-radius: 8px !important;
-        border: 1px solid #4b184f !important;
+        border: 1px solid #334155 !important;
     }
     .footer {
         text-align: center;
-        color: #a88bab;
+        color: #9ca3af;
         font-size: 13px;
         margin-top: 40px;
     }
-    .metric-label {
-        color: #ff4fc3;
+    hr {
+        border: 0.5px solid #1f2a40;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -93,30 +93,30 @@ st.markdown("""
 # HEADER
 # ---------------------------------------------------------------------
 st.markdown("<h1 style='text-align:center;'>C Autograder</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align:center; color:#e5e7eb;'>Groq OSS 20B + Gemini 2.5 Flash – Intelligent Code Evaluation Suite</p>", unsafe_allow_html=True)
-st.markdown("<hr style='border:1px solid #3a1040;'>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center; color:#cbd5e1;'>Groq OSS 20B + Gemini 2.5 Flash – Intelligent Code Evaluation Platform</p>", unsafe_allow_html=True)
+st.markdown("<hr>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------
 # STEP 1 – UPLOAD CODE
 # ---------------------------------------------------------------------
-with st.container():
-    st.subheader("Step 1 – Upload or Paste Your C Code")
-    st.markdown("Upload your `.c` source file or paste your code below to start evaluation.")
-    uploaded = st.file_uploader("Upload a `.c` file", type=["c"])
-    code_text = uploaded.read().decode("utf-8") if uploaded else st.text_area(
-        "Or paste your code here:", height=250, placeholder="// Enter your C program..."
-    )
+st.subheader("Step 1 – Upload or Paste Your C Code")
+st.markdown("Upload your `.c` source file or paste your code below to start the evaluation process.")
 
-    if code_text:
-        st.success("✅ Code loaded successfully. You can now generate test cases.")
-        st.session_state["code_text"] = code_text
-    else:
-        st.info("Please upload or paste valid C code to proceed.")
+uploaded = st.file_uploader("Upload a `.c` file", type=["c"])
+code_text = uploaded.read().decode("utf-8") if uploaded else st.text_area(
+    "Or paste your code here:", height=250, placeholder="// Enter your C program..."
+)
+
+if code_text:
+    st.success("✅ Code loaded successfully. You can now generate test cases.")
+    st.session_state["code_text"] = code_text
+else:
+    st.info("Please upload or paste valid C code to proceed.")
 
 # ---------------------------------------------------------------------
 # STEP 2 – GENERATE TEST CASES
 # ---------------------------------------------------------------------
-st.markdown("---")
+st.markdown("<hr>", unsafe_allow_html=True)
 st.subheader("Step 2 – Generate Test Cases (Groq OSS 20B)")
 
 code_text = st.session_state.get("code_text", "")
@@ -136,7 +136,7 @@ else:
 # ---------------------------------------------------------------------
 # STEP 3 – RUN EVALUATION
 # ---------------------------------------------------------------------
-st.markdown("---")
+st.markdown("<hr>", unsafe_allow_html=True)
 st.subheader("Step 3 – Run Evaluation and Generate Report")
 
 code_text = st.session_state.get("code_text", "")
@@ -238,5 +238,5 @@ if st.button("Run Evaluation"):
 # ---------------------------------------------------------------------
 # FOOTER
 # ---------------------------------------------------------------------
-st.markdown("<hr style='border:1px solid #3a1040;'>", unsafe_allow_html=True)
+st.markdown("<hr>", unsafe_allow_html=True)
 st.markdown("<div class='footer'>© 2025 C Autograder · Powered by Groq OSS 20B + Gemini 2.5 Flash</div>", unsafe_allow_html=True)
