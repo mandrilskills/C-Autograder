@@ -92,6 +92,33 @@ if run_btn:
             # llm_reporter: pass llm_agents.generate_detailed_report only if requested
             llm_reporter = llm_agents.generate_detailed_report if generate_llm_report else None
             results = grader.run_grader_pipeline(code_to_grade, tests=tests_list, llm_reporter=llm_reporter)
+            # Show results
+if show_raw:
+    st.subheader("Raw pipeline output")
+    st.json(results)
+
+st.subheader("Summary")
+
+if results.get("error"):
+    st.error(f"Pipeline error: {results.get('error')}")
+else:
+    st.metric("Final Score", f"{results.get('final_score', 0)} / 100")
+
+    st.markdown("### Detailed Report")
+    report_text = results.get("report") or "No report generated."
+    st.markdown(report_text.replace("\n", "<br/>"), unsafe_allow_html=True)
+
+    # --- Create human-readable PDF report ---
+    pdf_bytes = grader.create_pdf_report(report_text, results)
+    st.download_button(
+        label="📄 Download Full Report (PDF)",
+        data=pdf_bytes,
+        file_name="C_Grading_Report.pdf",
+        mime="application/pdf",
+    )
+
+    st.success("✅ Evaluation complete. Temporary binaries cleaned up automatically.")
+
         except Exception as e:
             st.error(f"Grading pipeline failed: {e}")
             results = {"error": str(e)}
@@ -149,3 +176,4 @@ if run_btn:
 
 st.markdown("---")
 st.caption("This is a development/demo autograder. For production use, implement robust sandboxing and monitoring.")
+
