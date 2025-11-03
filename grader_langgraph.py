@@ -1,21 +1,7 @@
-# grader_langgraph.py
-"""
-Core grader that compiles via gcc, statically analyses with cppcheck,
-executes test cases, measures simple performance, orchestrates results into JSON,
-and requests LLM to write final human-readable report (LLM ONLY for report generation).
-Also builds a PDF report for download.
-"""
-
-import os
-import subprocess
-import tempfile
-import time
-import shutil
-import json
-import logging
+# grader_langgraph.py (Flexible Test Case Evaluation)
+import os, json, subprocess, tempfile, time, shutil, logging
+from typing import Any, Dict, List, Optional
 from io import BytesIO
-from typing import List, Dict, Any, Optional
-
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -23,260 +9,191 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ---------- Compilation ----------
-def compile_code(code_text: str) -> Dict[str, Any]:
-    temp_dir = tempfile.mkdtemp(prefix="grader_compile_")
-    source_path = os.path.join(temp_dir, "submission.c")
-    binary_path = os.path.join(temp_dir, "submission_bin")
-
-    with open(source_path, "w") as f:
-        f.write(code_text)
-
-    # compile with warnings enabled; include strict flags
-    compile_cmd = ["gcc", source_path, "-o", binary_path, "-std=c11", "-Wall", "-Wextra"]
-    proc = subprocess.run(compile_cmd, capture_output=True, text=True, cwd=temp_dir)
-    compile_info = {
-        "status": "success" if proc.returncode == 0 else "error",
-        "binary_path": binary_path if proc.returncode == 0 else None,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-        "returncode": proc.returncode,
-        "temp_dir": temp_dir,
-    }
-    return compile_info
-
-# ---------- Static analysis ----------
-def analyze_code_static(source_path: str) -> Dict[str, Any]:
-    # source_path must point to the C file
-    issues = []
-    # Run cppcheck if installed
+# ----------- Utilities -----------
+def _try_parse_json(text: str):
     try:
-        cpp = subprocess.run(
-            ["cppcheck", "--enable=warning,style,performance,portability", source_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10, cwd=os.path.dirname(source_path)
-        )
-        out = cpp.stdout + cpp.stderr
-        # collect non-empty lines as issues (cppcheck emits on stderr)
-        for line in out.splitlines():
+        return json.loads(text)
+    except Exception:
+        return None
+
+def normalize_tests(test_block: Any) -> List[Dict[str, str]]:
+    """
+    Accepts test_block in any flexible format:
+      - String (multiline)
+      - JSON list or dict
+      - Raw list
+    Returns unified list of {input, expected} dicts.
+    """
+    tests = []
+
+    # Case 1: JSON format
+    if isinstance(test_block, str):
+        js = _try_parse_json(test_block)
+        if js:
+            test_block = js
+
+    # Case 2: If it's a dict with key 'tests'
+    if isinstance(test_block, dict) and "tests" in test_block:
+        test_block = test_block["tests"]
+
+    # Case 3: If it's already list of dicts
+    if isinstance(test_block, list) and all(isinstance(t, dict) for t in test_block):
+        for t in test_block:
+            tests.append({
+                "input": str(t.get("input", "")),
+                "expected": str(t.get("expected", "")).strip()
+            })
+        return tests
+
+    # Case 4: If it's raw text
+    if isinstance(test_block, str):
+        for line in test_block.splitlines():
             line = line.strip()
             if not line:
                 continue
-            # Ignore summary lines from cppcheck
-            if line.startswith("Checking") or line.startswith("Note:"):
-                continue
-            issues.append(line)
-    except FileNotFoundError:
-        # cppcheck not installed — fall back to heuristic scanning
-        issues.append("cppcheck not available - fell back to heuristic checks")
-    except Exception as e:
-        logger.warning("cppcheck run failed: %s", e)
-        issues.append(f"cppcheck error: {e}")
+            if "::" in line:
+                parts = line.split("::", 1)
+                tests.append({"input": parts[0].strip(), "expected": parts[1].strip()})
+            else:
+                # Input-only test (no expected)
+                tests.append({"input": line, "expected": ""})
+        return tests
 
-    # Additional heuristic checks (LLM must not be used here)
+    # Case 5: Fallback
+    if isinstance(test_block, list):
+        for item in test_block:
+            tests.append({"input": str(item), "expected": ""})
+
+    return tests
+
+# ----------- Core Steps -----------
+def compile_code(code: str) -> Dict[str, Any]:
+    temp_dir = tempfile.mkdtemp(prefix="grader_")
+    src = os.path.join(temp_dir, "main.c")
+    with open(src, "w") as f:
+        f.write(code)
+    exe = os.path.join(temp_dir, "main.out")
+
+    proc = subprocess.run(["gcc", src, "-o", exe, "-std=c11", "-Wall"], capture_output=True, text=True)
+    return {
+        "status": "success" if proc.returncode == 0 else "error",
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "binary": exe if proc.returncode == 0 else None,
+        "temp_dir": temp_dir
+    }
+
+def static_analysis(src_path: str) -> Dict[str, Any]:
+    issues = []
     try:
-        with open(source_path, "r") as f:
-            code = f.read()
-        if "gets(" in code:
-            issues.append("Use of unsafe function gets()")
-        if "system(" in code:
-            issues.append("Use of system() call")
-        if "while(1)" in code or "for(;;)" in code:
-            issues.append("Potential infinite loop pattern detected")
-    except Exception:
-        pass
+        out = subprocess.run(
+            ["cppcheck", "--enable=all", src_path],
+            capture_output=True, text=True, timeout=10
+        )
+        for line in (out.stdout + out.stderr).splitlines():
+            if line and "Checking" not in line:
+                issues.append(line.strip())
+    except Exception as e:
+        issues.append(f"Static analysis error: {e}")
+    return {"count": len(issues), "issues": issues}
 
-    return {"issues": issues, "count": len(issues)}
+def run_tests(binary: str, tests: List[Dict[str, str]], timeout: int = 3) -> Dict[str, Any]:
+    if not binary:
+        return {"status": "error", "results": []}
 
-# ---------- Test runner ----------
-def run_test_cases(compile_info: Dict[str, Any], tests: List[str], timeout_per_test: int = 3) -> Dict[str, Any]:
-    if not compile_info.get("binary_path"):
-        return {"status": "error", "passed": 0, "total": len(tests), "results": [], "score": 0}
-
-    binary_path = compile_info["binary_path"]
-    results = []
-    passed = 0
-    total = len(tests)
-
-    for case in tests:
-        if "::" not in case:
-            # ignore malformed lines but include as fail
-            results.append({
-                "raw": case,
-                "input": None,
-                "expected": None,
-                "actual": None,
-                "time": None,
-                "success": False,
-                "error": "malformed test (expected format input::expected_output)"
-            })
-            continue
-        input_data, expected_output = case.split("::", 1)
-        input_bytes = input_data.encode()
+    results, passed = [], 0
+    for t in tests:
+        inp, exp = t["input"], t.get("expected", "")
         try:
-            start = time.time()
             proc = subprocess.run(
-                [binary_path],
-                input=input_bytes,
+                [binary],
+                input=inp.encode(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=timeout_per_test,
-                cwd=os.path.dirname(binary_path)
+                timeout=timeout
             )
-            elapsed = round(time.time() - start, 6)
-            actual_output = proc.stdout.decode(errors="ignore").strip()
-            success = actual_output == expected_output.strip()
-            record = {
-                "input": input_data,
-                "expected": expected_output.strip(),
-                "actual": actual_output,
-                "stderr": proc.stderr.decode(errors="ignore").strip(),
-                "time": elapsed,
+            out = proc.stdout.decode().strip()
+            success = (exp.strip() == "" or out == exp.strip())
+            results.append({
+                "input": inp,
+                "expected": exp,
+                "actual": out,
+                "stderr": proc.stderr.decode().strip(),
                 "success": success
-            }
+            })
             if success:
                 passed += 1
-            results.append(record)
         except subprocess.TimeoutExpired:
-            results.append({
-                "input": input_data,
-                "expected": expected_output.strip(),
-                "actual": "(timeout)",
-                "stderr": "",
-                "time": None,
-                "success": False
-            })
+            results.append({"input": inp, "expected": exp, "actual": "(timeout)", "stderr": "", "success": False})
         except Exception as e:
-            results.append({
-                "input": input_data,
-                "expected": expected_output.strip(),
-                "actual": None,
-                "stderr": str(e),
-                "time": None,
-                "success": False
-            })
+            results.append({"input": inp, "expected": exp, "actual": "", "stderr": str(e), "success": False})
+    score = round((passed / len(tests) * 100), 2) if tests else 0
+    return {"status": "done", "passed": passed, "total": len(tests), "results": results, "score": score}
 
-    score_pct = round((passed / total) * 100, 2) if total > 0 else 0.0
-    return {"status": "done", "passed": passed, "total": total, "results": results, "score": score_pct}
-
-# ---------- Performance measurement ----------
-def measure_performance(compile_info: Dict[str, Any], samples: int = 3, timeout=2) -> Dict[str, Any]:
-    if not compile_info.get("binary_path"):
+def measure_performance(binary: str) -> Dict[str, Any]:
+    if not binary:
         return {"avg_time": None, "comment": "No binary to test."}
-    binary = compile_info["binary_path"]
     times = []
-    for _ in range(samples):
-        try:
-            start = time.time()
-            subprocess.run([binary], input=b"", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, cwd=os.path.dirname(binary))
-            times.append(time.time() - start)
-        except subprocess.TimeoutExpired:
-            return {"avg_time": None, "comment": "Execution timed out during performance test."}
-        except Exception as e:
-            logger.warning("Performance run failed: %s", e)
-            return {"avg_time": None, "comment": f"Performance run error: {e}"}
-    avg = round(sum(times) / len(times), 6)
-    comment = "Excellent performance." if avg < 0.05 else ("Acceptable performance." if avg < 0.5 else "Consider optimizing code efficiency.")
+    for _ in range(3):
+        start = time.time()
+        subprocess.run([binary], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
+        times.append(time.time() - start)
+    avg = round(sum(times)/len(times), 5)
+    comment = "Fast" if avg < 0.1 else "Moderate" if avg < 0.5 else "Slow"
     return {"avg_time": avg, "comment": comment}
 
-# ---------- Score calculation (agent-only) ----------
-def calculate_score(compile_info: Dict[str, Any], static_info: Dict[str, Any], test_info: Dict[str, Any], perf_info: Dict[str, Any]) -> float:
-    # weights are intentionally explicit and fixed (no LLM influence)
-    compile_score = 1.0 if compile_info.get("status") == "success" else 0.0
-    static_penalty = 0.0
-    if static_info.get("count", 0) > 0:
-        # each issue reduces static score (capped)
-        static_penalty = min(0.5, 0.05 * static_info.get("count", 0))
-    static_score = 1.0 - static_penalty
-    test_score = (test_info.get("score", 0) / 100.0)  # convert percent to 0..1
-    perf_score = 1.0 if perf_info.get("avg_time") is not None and perf_info.get("avg_time") < 0.5 else 0.6 if perf_info.get("avg_time") is not None else 0.0
+def score_calc(c, s, t, p):
+    compile_s = 1 if c["status"] == "success" else 0
+    static_s = max(0, 1 - (0.05 * s.get("count", 0)))
+    test_s = t.get("score", 0) / 100
+    perf_s = 1 if p.get("avg_time") and p["avg_time"] < 0.5 else 0.6
+    return round((0.25*compile_s + 0.45*test_s + 0.15*static_s + 0.15*perf_s)*100, 2)
 
-    # weighted combination
-    final = 0.25 * compile_score + 0.45 * test_score + 0.15 * static_score + 0.15 * perf_score
-    final_pct = round(final * 100, 2)
-    return final_pct
-
-# ---------- PDF report builder ----------
-def create_pdf_report(report_text: str, evaluation_json: Dict[str, Any]) -> bytes:
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
+def make_pdf(report_text, evaluation):
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4)
     styles = getSampleStyleSheet()
-    elements = []
-    elements.append(Paragraph("<b>C Autograder Evaluation Report</b>", styles["Title"]))
-    elements.append(Spacer(1, 8))
-    elements.append(Paragraph(report_text.replace("\n", "<br/>"), styles["BodyText"]))
-    elements.append(Spacer(1, 12))
-    elements.append(Paragraph("<b>Machine-readable Evaluation (JSON):</b>", styles["Heading3"]))
-    pretty_json = json.dumps(evaluation_json, indent=2)
-    # break JSON into chunks for Paragraphs
-    for chunk in pretty_json.splitlines():
-        elements.append(Paragraph(chunk.replace(" ", "&nbsp;"), styles["Code"]))
-    doc.build(elements)
-    pdf_data = buffer.getvalue()
-    buffer.close()
-    return pdf_data
+    elems = [
+        Paragraph("C Autograder Report", styles["Title"]),
+        Spacer(1, 10),
+        Paragraph(report_text.replace("\n", "<br/>"), styles["Normal"]),
+        Spacer(1, 10),
+        Paragraph("Evaluation JSON", styles["Heading3"]),
+        Paragraph(json.dumps(evaluation, indent=2).replace(" ", "&nbsp;"), styles["Code"])
+    ]
+    doc.build(elems)
+    return buf.getvalue()
 
-# ---------- Main pipeline ----------
-def run_grader_pipeline(code_text: str, tests: List[str], llm_reporter=None) -> Dict[str, Any]:
-    # 1. compile
+def run_grader_pipeline(code_text: str, tests_raw: Any, llm_reporter=None):
     compile_info = compile_code(code_text)
+    src = os.path.join(compile_info["temp_dir"], "main.c")
+    static_info = static_analysis(src)
+    tests = normalize_tests(tests_raw)
+    test_info = run_tests(compile_info.get("binary"), tests)
+    perf_info = measure_performance(compile_info.get("binary"))
+    final_score = score_calc(compile_info, static_info, test_info, perf_info)
 
-    # 2. static analysis (pass path to source file)
-    source_path = os.path.join(compile_info.get("temp_dir", ""), "submission.c") if compile_info.get("temp_dir") else None
-    static_info = analyze_code_static(source_path) if source_path else {"issues": ["no source file"], "count": 1}
-
-    # 3. tests
-    test_info = run_test_cases(compile_info, tests or [])
-
-    # 4. performance
-    perf_info = measure_performance(compile_info)
-
-    # 5. final score (agent computed)
-    final_score = calculate_score(compile_info, static_info, test_info, perf_info)
-
-    # 6. prepare evaluation JSON to send to LLM for a report (LLM only receives evaluation JSON)
     evaluation = {
-        "code_summary": {"length_lines": len(code_text.splitlines())},
-        "compile": {k: compile_info.get(k) for k in ("status", "stdout", "stderr", "returncode")},
+        "compile": compile_info,
         "static": static_info,
         "test": test_info,
         "perf": perf_info,
         "final_score": final_score
     }
 
-    llm_report = None
-    try:
-        if llm_reporter:
-            # IMPORTANT: only pass the evaluation JSON (no hidden grading logic). The LLM writes a textual report.
-            llm_report = llm_reporter(evaluation)
-    except Exception as e:
-        logger.exception("LLM report generation failed: %s", e)
-        llm_report = f"(LLM report generation failed: {e})"
+    report = None
+    if llm_reporter:
+        report = llm_reporter(evaluation)
 
-    # 7. Build PDF that contains the LLM report (or fallback text) + evaluation JSON
-    try:
-        report_text = llm_report or "No LLM report generated."
-        pdf_bytes = create_pdf_report(report_text, evaluation)
-    except Exception as e:
-        logger.exception("PDF generation failed: %s", e)
-        pdf_bytes = None
+    pdf_bytes = make_pdf(report or "No report.", evaluation)
+    shutil.rmtree(compile_info["temp_dir"], ignore_errors=True)
 
-    # 8. cleanup
-    try:
-        if compile_info and compile_info.get("temp_dir"):
-            shutil.rmtree(compile_info["temp_dir"], ignore_errors=True)
-    except Exception as e:
-        logger.warning("Cleanup failed: %s", e)
-
-    ret = {
-        "code": code_text,
+    return {
         "compile": compile_info,
         "static": static_info,
         "test": test_info,
         "perf": perf_info,
-        "score": final_score,
-        "report": llm_report,
         "final_score": final_score,
-        "pdf_bytes": pdf_bytes,
-        "evaluation_json": evaluation
+        "report": report,
+        "pdf_bytes": pdf_bytes
     }
-    return ret
