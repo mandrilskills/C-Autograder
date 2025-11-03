@@ -160,6 +160,7 @@ if st.button("🏁 Run Evaluation"):
                         "- What static issues were found\n"
                         "- Why tests failed (if any)\n"
                         "- Suggest clear improvements\n"
+                        "- If available provide a rectified and better code of the same problem else do not\n"
                         "- Conclude with an overall comment.\n\n"
                         f"Evaluation JSON:\n{json.dumps(evaluation, indent=2)}"
                     )
@@ -242,3 +243,4 @@ if st.button("🏁 Run Evaluation"):
             )
 
             st.caption("If Gemini output was limited, a retry or fallback summary was generated to ensure full feedback.")
+
