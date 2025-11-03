@@ -1,4 +1,4 @@
-# app.py (updated - robust Gemini report handling + split view + PDF)
+# app.py
 import streamlit as st
 import os
 from io import BytesIO
@@ -8,20 +8,22 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 import json
 import logging
 
-# import the functions; llm_agents contains generate_llm_report and internal _call_gemini
+# imports from local modules
 import llm_agents
 from llm_agents import generate_test_cases_with_logging
 from grader_langgraph import run_grader_pipeline
 
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Page setup
 st.set_page_config(page_title="C Autograder – Groq OSS 20B + Gemini 2.5 Flash", layout="wide")
 
 st.title("🎓 C Autograder – Groq OSS 20B + Gemini 2.5 Flash")
 st.caption("Groq (openai/gpt-oss-20b) → Test cases · GCC/Cppcheck → Evaluation · Gemini 2.5 Flash → Report")
 
-# Diagnostics
+# ---------------- Diagnostics ----------------
 with st.expander("🔧 Environment Diagnostics"):
     env_info = {
         "gcc": os.system("which gcc > /dev/null") == 0,
@@ -35,12 +37,12 @@ with st.expander("🔧 Environment Diagnostics"):
     except Exception as e:
         st.write(f"Gemini connection test failed: {e}")
 
-# Code input
+# ---------------- Code Input ----------------
 st.header("1️⃣ Upload or Paste C Code")
 uploaded = st.file_uploader("Upload a .c file", type=["c"])
 code_text = uploaded.read().decode("utf-8") if uploaded else st.text_area("Paste your C code here:", height=300)
 
-# Test case generation
+# ---------------- Test Case Generation ----------------
 if st.button("🚀 Generate Test Cases (Groq OSS 20B)"):
     if not code_text or not code_text.strip():
         st.error("Please enter valid C code first.")
@@ -51,21 +53,22 @@ if st.button("🚀 Generate Test Cases (Groq OSS 20B)"):
         st.session_state["tests"] = "\n".join(res["tests"])
         st.text_area("Generated Test Cases (Editable)", st.session_state["tests"], height=200)
 
-# Evaluation and report generation
+# ---------------- Evaluation ----------------
 st.header("2️⃣ Run Evaluation and Generate Report")
 if st.button("🏁 Run Evaluation"):
     if not code_text or not code_text.strip():
         st.warning("Please provide a valid C program first.")
     else:
-        # left: evaluation, right: report
+        # Split layout: Left = Evaluation, Right = Report
         left, right = st.columns([0.55, 0.45])
 
+        # ---------- LEFT PANEL: Evaluation ----------
         with left:
             with st.spinner("Running compilation, static analysis, and tests..."):
                 evaluation = run_grader_pipeline(
                     code_text,
                     st.session_state.get("tests", "").splitlines(),
-                    llm_reporter=llm_agents.generate_llm_report,  # normal reporter
+                    llm_reporter=llm_agents.generate_llm_report,
                 )
 
             compile_info = evaluation.get("compile", {})
@@ -82,14 +85,14 @@ if st.button("🏁 Run Evaluation"):
 
             st.success("✅ Evaluation Completed")
 
-            # Compilation
+            # Compilation summary
             st.markdown("### 🧱 Compilation")
             if compile_info.get("status") == "success":
                 st.write("✅ Code compiled successfully using GCC.")
             else:
                 st.error(f"❌ Compilation failed:\n\n{compile_info.get('stderr', 'No message available.')}")
 
-            # Static
+            # Static analysis
             st.markdown("### 🧩 Static Analysis (Cppcheck)")
             issues = static_info.get("issues", [])
             if issues:
@@ -99,7 +102,7 @@ if st.button("🏁 Run Evaluation"):
             else:
                 st.write("✅ No static issues detected.")
 
-            # Functional tests
+            # Test results
             st.markdown("### 🧪 Functional Testing")
             if not test_info:
                 st.info("No test cases executed.")
@@ -131,106 +134,87 @@ if st.button("🏁 Run Evaluation"):
 
             st.metric(label="🏆 Final Score", value=f"{final_score} / 100")
 
-        # RIGHT PANEL: Gemini report (non-editable) and PDF download
+        # ---------- RIGHT PANEL: Gemini Report ----------
         with right:
             st.markdown("### 📘 Gemini 2.5 Flash Report")
 
-            # 1) Primary attempt: use standard reporter (which expects evaluation dict)
+            # Try Gemini normally first
             report_text = None
             try:
                 with st.spinner("Generating student-friendly report (Gemini 2.5 Flash)..."):
                     report_text = llm_agents.generate_llm_report(evaluation)
             except Exception as e:
-                logger.warning(f"generate_llm_report raised: {e}")
-                report_text = None
+                logger.warning(f"Gemini report generation failed: {e}")
 
-            # Check if result is usable
-            def is_valid_report(s: str) -> bool:
-                return bool(s) and isinstance(s, str) and len(s.strip()) > 60
+            def is_valid_report(text):
+                return bool(text) and isinstance(text, str) and len(text.strip()) > 60
 
-            # 2) If short/empty, retry with an explicit simple-language prompt via internal call
+            # Retry if report is too short or missing
             if not is_valid_report(report_text):
-                logger.info("Primary Gemini report empty/short — attempting one retry with explicit simple prompt.")
+                logger.info("Primary Gemini report empty — retrying with explicit simple-language prompt.")
                 try:
                     simple_prompt = (
-                        "You are an assistant explaining evaluation results to students in plain English.\n\n"
-                        "Given this evaluation JSON, produce a clear and detailed feedback report in simple language. "
-                        "Explain compilation status, static analysis issues (if any), why tests failed (if any), and give 3 practical improvement tips. "
-                        "Keep it educational and avoid heavy technical jargon. Be specific where possible.\n\n"
+                        "You are an AI teacher explaining this code evaluation to students.\n"
+                        "Given the JSON below, explain in simple language:\n"
+                        "- Whether the code compiled or not\n"
+                        "- What static issues were found\n"
+                        "- Why tests failed (if any)\n"
+                        "- Suggest clear improvements\n"
+                        "- Conclude with an overall comment.\n\n"
                         f"Evaluation JSON:\n{json.dumps(evaluation, indent=2)}"
                     )
-                    # Use internal call directly to _call_gemini (2.5 flash only)
-                    # _call_gemini is internal to llm_agents; we access it intentionally for retry.
                     report_text = llm_agents._call_gemini(simple_prompt, max_output_tokens=1200)
                 except Exception as e:
-                    logger.warning(f"Retry via _call_gemini failed: {e}")
+                    logger.warning(f"Gemini retry failed: {e}")
                     report_text = None
 
-            # 3) If still invalid, produce deterministic fallback summary so student always gets useful info
+            # Final fallback if still empty
             if not is_valid_report(report_text):
-                logger.warning("Gemini report unavailable after retry — creating fallback student-friendly report locally.")
-                # Build a friendly fallback
-                lines = []
-                # Compilation
+                logger.warning("Gemini report unavailable after retry — using fallback summary.")
+                fallback_lines = []
                 if compile_info.get("status") == "success":
-                    lines.append("Compilation: Your program compiled successfully.")
+                    fallback_lines.append("Compilation: Your program compiled successfully.")
                 else:
-                    lines.append("Compilation: Your program failed to compile. Check the compiler error messages and fix syntax/typos.")
+                    fallback_lines.append("Compilation: Your program failed to compile. Please fix syntax errors.")
                     if compile_info.get("stderr"):
-                        lines.append(f"Compiler messages: {compile_info.get('stderr')}")
-                # Static
+                        fallback_lines.append(f"Compiler output: {compile_info.get('stderr')}")
                 if static_info.get("issues"):
-                    lines.append(f"Static Analysis: {len(static_info.get('issues'))} issue(s) found. Examples:")
+                    fallback_lines.append(f"Static Analysis: {len(static_info.get('issues'))} issue(s) found.")
                     for it in static_info.get("issues")[:3]:
-                        lines.append(f"- {it}")
-                    lines.append("Suggestion: Address the reported warnings; they often point to portability or correctness issues.")
+                        fallback_lines.append(f"- {it}")
                 else:
-                    lines.append("Static Analysis: No major issues reported by Cppcheck.")
-                # Tests
-                if not test_info:
-                    lines.append("Functional Tests: No test cases were run.")
-                else:
+                    fallback_lines.append("Static Analysis: No major issues detected.")
+                if test_info:
                     passed = sum(1 for t in test_info if t["success"])
                     total = len(test_info)
-                    lines.append(f"Functional Tests: {passed}/{total} passed.")
-                    for t in test_info[:5]:
-                        status = "passed" if t["success"] else "failed"
-                        lines.append(f"- Test input `{t['input']}` {status}. Expected `{t['expected']}`, got `{t['actual']}`.")
+                    fallback_lines.append(f"Functional Tests: {passed}/{total} passed.")
                     if passed < total:
-                        lines.append("Suggestion: Check output formatting and remove extra prompts like 'Enter...' so automated checks match your output.")
-                # Performance
+                        fallback_lines.append("Tip: Ensure no extra print prompts like 'Enter number:' appear in automated outputs.")
                 perf_comment = perf_info.get("comment", "")
                 if perf_comment:
-                    lines.append(f"Performance: {perf_comment}")
-                # Final
-                lines.append(f"Overall: Final Score = {final_score}/100. Keep iterating—focus on fixing failing tests and static warnings.")
-                report_text = "\n\n".join(lines)
+                    fallback_lines.append(f"Performance: {perf_comment}")
+                fallback_lines.append(f"Overall Score: {final_score}/100.")
+                report_text = "\n\n".join(fallback_lines)
 
-            # Display (styled, non-editable)
-           safe_html = report_text.replace("\n", "<br/>")
-html_block = """
-<div style="
-    background-color: #fbfbfb;
-    padding: 16px;
-    border-radius: 12px;
-    border: 1px solid #e2e2e2;
-    color: #111;">
-    {}
-</div>
-""".format(safe_html)
-st.markdown(html_block, unsafe_allow_html=True)
+            # Safe HTML conversion (fixed syntax)
+            safe_html = report_text.replace("\n", "<br/>")
 
+            # Display as styled non-editable section
+            st.markdown(
+                f"""
+                <div style="
+                    background-color: #fbfbfb;
+                    padding: 16px;
+                    border-radius: 12px;
+                    border: 1px solid #e2e2e2;
+                    color: #111;">
+                    {safe_html}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-
-            # Provide user info if we had to retry/fallback
-            if not llm_agents or not report_text:
-                st.warning("Report may be incomplete. A fallback summary was shown.")
-            else:
-                # If original generate_llm_report returned short and we retried, inform user
-                # (We use heuristic: if first attempt returned something but short; that info isn't tracked here, so keep minimal)
-                pass
-
-            # PDF generation (always provide)
+            # -------- PDF Generation --------
             def generate_pdf(report: str) -> BytesIO:
                 buffer = BytesIO()
                 doc = SimpleDocTemplate(buffer, pagesize=A4)
@@ -241,10 +225,9 @@ st.markdown(html_block, unsafe_allow_html=True)
                 story.append(Paragraph(f"<b>Final Score:</b> {final_score}/100", styles["Normal"]))
                 story.append(Spacer(1, 12))
                 story.append(Paragraph("<b>Detailed Feedback</b>", styles["Heading2"]))
-                # keep newlines
                 story.append(Paragraph(report.replace("\n", "<br/>"), styles["Normal"]))
                 story.append(Spacer(1, 20))
-                story.append(Paragraph("<b>Generated via Gemini 2.5 Flash (or local fallback)</b>", styles["Italic"]))
+                story.append(Paragraph("<b>Generated via Gemini 2.5 Flash (or fallback)</b>", styles["Italic"]))
                 doc.build(story)
                 buffer.seek(0)
                 return buffer
@@ -258,6 +241,4 @@ st.markdown(html_block, unsafe_allow_html=True)
                 use_container_width=True,
             )
 
-            st.caption("If the report looks short, the system retried the LLM and provided a local fallback to ensure you always receive helpful feedback.")
-
-
+            st.caption("If Gemini output was limited, a retry or fallback summary was generated to ensure full feedback.")
