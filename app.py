@@ -18,8 +18,7 @@ st.markdown(
 ### 🧠 Features
 1. Auto-generate **test cases** for your C code  
 2. Compile & run it against those cases  
-3. Create a **detailed Gemini report**  
-4. If no test cases can be generated → perform **static evaluation**
+3. Create a **detailed Gemini report** 4. If no test cases can be generated → perform **static evaluation**
 """
 )
 
@@ -28,6 +27,8 @@ if st.button("🔍 Test Gemini 2.5 Flash Connection"):
     import google.generativeai as genai
 
     try:
+        # Note: In the Canvas environment, the API key is automatically handled.
+        # We ensure the model is configured for a quick test.
         genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
         model = genai.GenerativeModel("gemini-2.5-flash")
         resp = model.generate_content("Say 'Gemini 2.5 Flash connected successfully!'")
@@ -47,7 +48,7 @@ if uploaded_file:
     with st.spinner("🧠 Generating test cases using Gemini 2.5 Flash..."):
         test_cases = generate_test_cases(code_text)
 
-    # ---------- Case 1 – Normal test-based flow ---------- #
+    # ---------- Case 1 – Normal test-based flow (Actual Execution) ---------- #
     if test_cases:
         st.success("✅ Test cases generated successfully.")
         st.json(test_cases)
@@ -58,6 +59,7 @@ if uploaded_file:
         st.info("⚙️ Compiling and testing program...")
 
         try:
+            # --- Compilation ---
             compile_result = subprocess.run(
                 ["gcc", "submitted_code.c", "-o", "program"],
                 capture_output=True,
@@ -71,7 +73,11 @@ if uploaded_file:
             else:
                 st.success("✅ Compilation successful! Running test cases...")
                 results = []
+                
+                # --- Execution ---
                 for case in test_cases:
+                    expected_output = case["expected_output"].strip()
+                    
                     try:
                         process = subprocess.run(
                             ["./program"],
@@ -80,33 +86,50 @@ if uploaded_file:
                             capture_output=True,
                             timeout=3,
                         )
+                        
                         actual_output = process.stdout.strip()
-                        expected_output = case["expected_output"].strip()
+                        # Use string 'PASS'/'FAIL' for consistency with LLM reporting
+                        result_status = "PASS" if actual_output == expected_output else "FAIL"
+                        
                         results.append(
                             {
                                 "input": case["input"],
                                 "expected_output": expected_output,
                                 "actual_output": actual_output,
-                                "passed": actual_output == expected_output,
+                                "result": result_status,
                             }
                         )
+                        
                     except subprocess.TimeoutExpired:
                         results.append(
                             {
                                 "input": case["input"],
-                                "error": "Execution timed out",
-                                "passed": False,
+                                "expected_output": expected_output,
+                                "actual_output": "TIMED OUT",
+                                "result": "FAIL",
                             }
                         )
                     except Exception as e:
                         results.append(
-                            {"input": case["input"], "error": str(e), "passed": False}
+                            {
+                                "input": case["input"],
+                                "expected_output": expected_output,
+                                "actual_output": f"RUNTIME ERROR: {str(e)}",
+                                "result": "FAIL",
+                            }
                         )
-
+                
+                # --- Display Results ---
                 st.write("### 🧾 Test Case Results")
+                
+                # Calculate passes/fails using the consistent 'result' key
+                passes = sum(1 for r in results if r.get('result') == 'PASS')
+                st.info(f"Summary: **{passes}/{len(results)} tests passed.**")
+                
                 st.json(results)
 
                 with st.spinner("📝 Generating performance report..."):
+                    # Pass the results (now correctly formatted with 'result': 'PASS'|'FAIL')
                     report_text = generate_detailed_report(code_text, results)
 
         except Exception as e:
@@ -135,4 +158,4 @@ if uploaded_file:
         )
 
 st.divider()
-st.caption("🔹 Built with Streamlit · Gemini 2.5 Flash · LangGraph 2025")
+st.caption("🔹 Built with Streamlit · Gemini 2.5 Flash")
