@@ -1,168 +1,156 @@
 # llm_agents.py
 import os
 import logging
-import json
-from typing import List, Dict, Any, Optional
+import google.generativeai as genai
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# -------------------------------------------------------------------
-# Try to import Gemini SDK
-# -------------------------------------------------------------------
-try:
-    import google.generativeai as genai
-    GENAI_SDK = True
-except Exception:
-    GENAI_SDK = False
-    logger.warning("google-generativeai not installed or unavailable.")
-
-# -------------------------------------------------------------------
-# Robust Gemini Caller with Automatic Model Fallback
-# -------------------------------------------------------------------
-def _call_gemini(prompt: str, max_output_tokens: int = 800) -> Optional[str]:
-    """
-    Robust Gemini API call with automatic model fallback and debug logs.
-    """
-    if not GENAI_SDK:
-        logger.warning("google-generativeai not installed.")
-        return None
-
+# -------------------- Setup --------------------
+def configure_gemini():
     api_key = os.getenv("GENAI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        logger.warning("GENAI_API_KEY missing in environment.")
-        return None
-
+        raise EnvironmentError("Gemini API key not found in environment variables.")
     genai.configure(api_key=api_key)
-    model_names = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
-    last_error = None
 
-    for m in model_names:
-        try:
-            logger.info(f"Attempting Gemini call with model: {m}")
-            model = genai.GenerativeModel(m)
-            response = model.generate_content(
-                prompt, generation_config={"max_output_tokens": max_output_tokens}
-            )
-
-            # Extract response text robustly
-            if hasattr(response, "text") and response.text:
-                return response.text.strip()
-            if hasattr(response, "candidates") and response.candidates:
-                try:
-                    return response.candidates[0].content.parts[0].text.strip()
-                except Exception:
-                    pass
-
-            logger.warning(f"Gemini {m} returned no text field: {str(response)[:200]}")
-        except Exception as e:
-            logger.warning(f"Gemini model {m} failed: {e}")
-            last_error = e
-            continue
-
-    logger.error(f"All Gemini models failed. Last error: {last_error}")
+def _call_gemini(prompt: str, model_name: str = "gemini-2.5-flash", max_output_tokens: int = 500) -> str:
+    """
+    Generic Gemini API call with safe fallback.
+    """
+    try:
+        configure_gemini()
+        model = genai.GenerativeModel(model_name)
+        response = model.generate_content(prompt, generation_config={"max_output_tokens": max_output_tokens})
+        if hasattr(response, "text") and response.text:
+            return response.text.strip()
+    except Exception as e:
+        logger.warning(f"Gemini model {model_name} failed: {e}")
     return None
 
-# -------------------------------------------------------------------
-# Deterministic Test-Case Generator
-# -------------------------------------------------------------------
-def generate_test_cases_with_logging(code_text: str, max_cases: int = 8) -> Dict[str, Any]:
+# -------------------- Heuristic Fallback --------------------
+def _heuristic_test_gen(code_text: str, max_cases: int = 5):
     """
-    Generate test cases for a C program using Gemini or heuristic fallback.
-    Returns {'status': 'ok'/'fallback', 'tests': [...], 'reason': '...'}
+    Fallback test case generator when Gemini fails or is unavailable.
     """
+    lines = []
+    if "largest" in code_text.lower():
+        lines = [
+            "2 3 1::3.00 is the largest number.",
+            "5 8 7::8.00 is the largest number.",
+            "10 2 3::10.00 is the largest number.",
+            "-5 -2 -10::-2.00 is the largest number.",
+        ]
+    elif "sum" in code_text.lower():
+        lines = [
+            "1 2::3",
+            "5 7::12",
+            "10 -2::8",
+        ]
+    else:
+        lines = ["42::42", "0::0", "5::5"]
+    return lines[:max_cases]
+
+# -------------------- Test Case Generation --------------------
+def generate_test_cases_with_logging(code_text: str, max_cases: int = 8) -> dict:
+    """
+    Generate test cases using Gemini 2.5 Flash, fallback to Gemini 1.5 Pro, then heuristic.
+    """
+    # Safer reworded prompt (avoids "simulate user input")
     prompt = f"""
-You are an automated C test case generator.
+You are a software quality assistant.
 
-Given the following C program, generate {max_cases} realistic input/output pairs.
-Each pair must be on a separate line using this format:
+Review the following C program and suggest up to {max_cases} sample cases
+that could verify its correctness.
 
-<input_values>::<expected_output>
+List each case in one line using this format:
+<example_values>::<expected_program_output>
 
-Rules:
-- Do NOT include any explanations, headings, or comments.
-- Use realistic numeric inputs based on scanf format specifiers in the program.
-- The expected output must exactly match what printf would print.
-- Do not wrap the response in JSON or markdown.
-- Avoid quotes or code blocks.
+Use realistic numeric examples when applicable.
+Do NOT include explanations or code fences.
 
 C program:
 {code_text}
 """
 
-    res_text = _call_gemini(prompt, max_output_tokens=400)
+    # ---- Try gemini-2.5-flash first ----
+    res_text = _call_gemini(prompt, model_name="gemini-2.5-flash", max_output_tokens=400)
 
-    # Try parsing Gemini output
+    # ---- Fallback to 1.5-pro if flash fails ----
+    if not res_text:
+        try:
+            logger.info("Gemini 2.5 Flash returned None, trying 1.5 Pro...")
+            configure_gemini()
+            model = genai.GenerativeModel("gemini-1.5-pro")
+            response = model.generate_content(prompt, generation_config={"max_output_tokens": 400})
+            if hasattr(response, "text") and response.text:
+                res_text = response.text.strip()
+                logger.info("Gemini 1.5 Pro succeeded.")
+        except Exception as e:
+            logger.warning(f"Gemini 1.5 Pro test generation failed: {e}")
+
+    # ---- Parse Gemini response ----
     if res_text:
         lines = [ln.strip() for ln in res_text.splitlines() if ln.strip()]
-        # Filter out possible markdown/code block markers
-        lines = [ln for ln in lines if not ln.startswith("```") and "::" in ln]
+        lines = [ln for ln in lines if "::" in ln and not ln.startswith("```")]
         if lines:
-            logger.info(f"Gemini generated {len(lines)} test cases successfully.")
-            return {"status": "ok", "tests": lines[:max_cases], "reason": "Gemini test-case generation succeeded."}
+            logger.info(f"Gemini produced {len(lines)} test cases.")
+            return {"status": "ok", "tests": lines[:max_cases], "reason": "Gemini succeeded"}
 
-    # If Gemini failed or returned junk → fallback deterministic generator
+    # ---- Heuristic fallback ----
     fallback_tests = _heuristic_test_gen(code_text, max_cases)
-    logger.warning("Gemini test-case generation failed. Using fallback heuristic.")
+    logger.warning("Gemini returned None — using heuristic fallback.")
     return {"status": "fallback", "tests": fallback_tests, "reason": "Gemini not available or returned none; used heuristic fallback"}
 
-# -------------------------------------------------------------------
-# Simple Fallback Heuristic
-# -------------------------------------------------------------------
-def _heuristic_test_gen(code_text: str, max_cases: int = 6) -> List[str]:
-    code = code_text.lower()
-    out = []
-    if "scanf" in code and "printf" in code and "+" in code:
-        out = ["2 3::5", "10 20::30", "-1 1::0", "0 0::0"]
-    elif "largest" in code and "if" in code:
-        out = [
-            "2 3 1::3.00 is the largest number.",
-            "5 8 7::8.00 is the largest number.",
-            "10 2 3::10.00 is the largest number.",
-            "-5 -2 -10::-2.00 is the largest number."
-        ]
-    elif "factorial" in code:
-        out = ["3::6", "5::120", "0::1"]
-    elif "reverse" in code:
-        out = ["123::321", "100::1"]
-    elif "prime" in code:
-        out = ["2::prime", "4::not prime", "17::prime"]
-    else:
-        out = ["1::1", "2::2", "3::3"]
-    return out[:max_cases]
-
-# -------------------------------------------------------------------
-# LLM Report Generator
-# -------------------------------------------------------------------
-def generate_detailed_report(evaluation: Dict[str, Any]) -> str:
+# -------------------- LLM-based Report Generation --------------------
+def generate_llm_report(evaluation: dict) -> str:
     """
-    Generate a structured evaluation report using Gemini, or fallback if unavailable.
+    Generate a structured analysis report based on evaluation JSON.
     """
-    prompt = (
-        "You are an expert C instructor. Based on the evaluation JSON below, write a structured report with these sections:\n"
-        "Summary, Compilation, Static Analysis, Functional Tests, Performance, and Recommendations.\n"
-        "Do NOT change numeric values or results. Keep tone analytical and professional.\n\n"
-        "Evaluation JSON:\n" + json.dumps(evaluation, indent=2)
-    )
+    prompt = f"""
+You are an expert C programming evaluator.
+Using the following structured evaluation JSON, write a detailed feedback report
+for the student explaining the results clearly.
 
-    res = _call_gemini(prompt, max_output_tokens=900)
-    if res:
-        return res
+Guidelines:
+- Start with a summary of overall performance.
+- Include sections for Compilation, Static Analysis, Functional Tests, and Performance.
+- Highlight strengths and weaknesses.
+- Provide actionable improvement suggestions.
+- Keep tone constructive and professional.
 
-    # Fallback text report
-    lines = ["FALLBACK REPORT — LLM not available"]
-    lines.append(f"Final Score: {evaluation.get('final_score', 'N/A')}")
-    comp = evaluation.get("compile", {})
-    if comp.get("status") != "success":
-        lines.append("Compilation failed. Stderr:")
-        lines.append(comp.get("stderr", ""))
-    else:
-        lines.append("Compiled successfully.")
-    static = evaluation.get("static", {})
-    lines.append(f"Static issues: {len(static.get('issues', []))}")
-    for it in static.get("issues", [])[:5]:
-        lines.append("- " + str(it))
-    test = evaluation.get("test", {})
-    lines.append(f"Tests passed: {test.get('passed', 0)} / {test.get('total', 0)}")
-    lines.append("Recommendations: Address static warnings, verify I/O format, and optimize logic as needed.")
-    return "\n".join(lines)
+Evaluation JSON:
+{evaluation}
+"""
+
+    report = _call_gemini(prompt, model_name="gemini-2.5-flash", max_output_tokens=800)
+    if not report:
+        logger.warning("Gemini 2.5 Flash failed to generate report, using 1.5 Pro fallback...")
+        try:
+            configure_gemini()
+            model = genai.GenerativeModel("gemini-1.5-pro")
+            resp = model.generate_content(prompt, generation_config={"max_output_tokens": 800})
+            if hasattr(resp, "text") and resp.text:
+                report = resp.text.strip()
+        except Exception as e:
+            logger.warning(f"Gemini 1.5 Pro report generation failed: {e}")
+
+    return report or "(LLM report generation failed — no output received.)"
+
+# -------------------- Diagnostics --------------------
+def test_gemini_connection() -> str:
+    """
+    Verify Gemini connectivity for both models.
+    """
+    try:
+        txt = _call_gemini("Say 'Gemini connection successful.'", model_name="gemini-2.5-flash", max_output_tokens=10)
+        if txt:
+            return f"Gemini Response: {txt}"
+        logger.info("Gemini 2.5 Flash unavailable, testing 1.5 Pro...")
+        configure_gemini()
+        model = genai.GenerativeModel("gemini-1.5-pro")
+        resp = model.generate_content("Say 'Gemini connection successful.'")
+        if hasattr(resp, "text") and resp.text:
+            return f"Gemini Response (1.5 Pro): {resp.text.strip()}"
+        return "Gemini models reachable but no response text."
+    except Exception as e:
+        return f"Gemini connection failed: {e}"
