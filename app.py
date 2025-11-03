@@ -143,7 +143,7 @@ if uploaded_file:
             report_text = fallback_code_evaluation(code_text)
 
     # ---------- Final Report and Download ---------- #
-    if report_text:
+    if 'report_text' in locals() and report_text:
         st.subheader("📘 Final Report")
         st.text_area("Gemini Evaluation Report", report_text, height=400)
 
@@ -159,3 +159,4 @@ if uploaded_file:
 
 st.divider()
 st.caption("🔹 Built with Streamlit · Gemini 2.5 Flash")
+
