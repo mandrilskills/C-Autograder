@@ -1,10 +1,11 @@
 import subprocess
 import time
 from pathlib import Path
-from typing import TypedDict, Dict, Any
+from typing import TypedDict, Dict, Any, List
 from langgraph.graph import StateGraph, END
 import asyncio
 import os
+import shutil
 
 # === Utility: wrap async → sync for LangGraph ===
 def make_sync(agent):
@@ -63,7 +64,8 @@ async def compile_agent(state: GraderState, config: Dict[str, Any]):
     exe_name = "a.out.exe" if os.name == "nt" else "a.out"
     cmd = ["gcc", "-std=c11", "main.c", "-o", exe_name, "-Wall", "-Wextra"]
 
-    proc = await run_subprocess(cmd, cwd=str(run_dir))
+    # Use run_subprocess for asynchronous execution
+    proc = await run_subprocess(cmd, cwd=str(run_dir), timeout=10) 
 
     success = proc.returncode == 0
     return {
@@ -78,41 +80,52 @@ async def compile_agent(state: GraderState, config: Dict[str, Any]):
     }
 
 async def static_agent(state: GraderState, config: Dict[str, Any]):
+    # Only run static analysis if compilation succeeded
+    if not state.get("compile", {}).get("success"):
+        return {"static": {"success": False, "score": 0.0, "issues": ["Skipped static analysis due to compilation failure."]}}
+
     run_dir = Path(state["compile"]["run_dir"])
     issues = []
     try:
-        cpp = subprocess.run(
+        # NOTE: cppcheck command must be available in the execution environment
+        cpp = await run_subprocess(
             ["cppcheck", "--enable=warning,style,performance", "main.c"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
+            timeout=15,
             cwd=str(run_dir)
         )
         out = cpp.stdout + cpp.stderr
         for line in out.splitlines():
             if line.strip():
                 issues.append(line.strip())
-    except Exception:
+    except Exception as e:
+        issues.append(f"Cppcheck execution failed: {e}")
         pass
+        
     score = max(0.0, 1.0 - 0.1 * len(issues))
     return {"static": {"success": True, "score": score, "issues": issues}}
 
 async def test_agent(state: GraderState, config: Dict[str, Any]):
+    # Only run tests if compilation succeeded
+    if not state.get("compile", {}).get("success"):
+        return {"test": {"success": False, "score": 0, "results": [], "passed": 0, "total": 0}}
+        
     configurable = config.get("configurable", {})
-    tests = configurable.get("tests", [])
+    # Expects tests as [{"input": "...", "output": "..."}, ...]
+    tests = configurable.get("tests", []) 
     run_dir = Path(state["compile"]["run_dir"])
 
     exe_path = Path(run_dir) / state["compile"]["exe_name"]
     if not exe_path.exists():
         return {"test": {"success": False, "score": 0, "results": []}}
 
+    # Command to run the executable
     exec_cmd = [str(exe_path)] if os.name == "nt" else ["./" + exe_path.name]
 
     results = []
     passed = 0
     for t in tests:
-        proc = await run_subprocess(exec_cmd, input_data=t["input"], cwd=str(run_dir))
+        # Use run_subprocess for asynchronous execution
+        proc = await run_subprocess(exec_cmd, input_data=t["input"], cwd=str(run_dir), timeout=5) 
         out = proc.stdout.strip()
         ok = out == t["output"].strip()
         results.append({
@@ -130,6 +143,10 @@ async def test_agent(state: GraderState, config: Dict[str, Any]):
     }
 
 async def performance_agent(state: GraderState, config: Dict[str, Any]):
+    # Only run performance if compilation succeeded
+    if not state.get("compile", {}).get("success"):
+        return {"perf": {"success": False, "score": 0, "avg_time": 0}}
+        
     run_dir = Path(state["compile"]["run_dir"])
     exe_path = Path(run_dir) / state["compile"]["exe_name"]
 
@@ -138,14 +155,18 @@ async def performance_agent(state: GraderState, config: Dict[str, Any]):
 
     exec_cmd = [str(exe_path)] if os.name == "nt" else ["./" + exe_path.name]
 
-    sample_input = "2 3"
+    sample_input = "2 3" # Using a generic small input for timing
     times = []
+    
+    # Run the program multiple times to get an average
     for _ in range(3):
         start = time.perf_counter()
-        await run_subprocess(exec_cmd, input_data=sample_input, cwd=str(run_dir))
+        # Use run_subprocess for asynchronous execution
+        await run_subprocess(exec_cmd, input_data=sample_input, cwd=str(run_dir), timeout=5) 
         times.append(time.perf_counter() - start)
 
-    avg = sum(times) / len(times)
+    avg = sum(times) / len(times) if times else 0
+    # Simple scoring logic based on average runtime
     score = 1.0 if avg < 0.05 else (0.7 if avg < 0.2 else 0.4)
     return {"perf": {"success": True, "score": score, "avg_time": avg}}
 
@@ -153,7 +174,8 @@ def orchestrate(state: GraderState, config: Dict[str, Any]):
     weights = {"compile": 0.25, "test": 0.45, "static": 0.15, "perf": 0.15}
     total = 0
     for k, w in weights.items():
-        total += w * state.get(k, {}).get("score", 0)
+        # Safely get the score, defaulting to 0 if the agent was skipped or failed
+        total += w * state.get(k, {}).get("score", 0) 
     return {"final": {"score": total}}
 
 def feedback(result: GraderState):
@@ -230,10 +252,48 @@ def build_grader_graph():
     g.add_edge("orchestrate", END)
     return g.compile()
 
-# === Optional LLM Summarizer (not used directly by app.py) ===
-def summarize_with_llm(result: GraderState):
+# --- Wrapper Function for Streamlit ---
+def run_grader_pipeline(source_code: str, tests: List[Dict[str, str]]) -> Dict:
+    """
+    Builds and runs the C code grading graph, managing configuration and cleanup.
+    
+    Returns:
+        The structured feedback dictionary from the feedback agent.
+    """
+    graph = build_grader_graph()
+    submission_id = str(time.time()).replace(".", "") # Unique ID for run folder
+
+    config = {
+        "configurable": {
+            "submission_id": submission_id,
+            "source_code": source_code,
+            "tests": tests
+        }
+    }
+    
+    run_dir = WORK_DIR / submission_id
+    run_dir.mkdir(exist_ok=True)
+    
     try:
-        from llm_agents import generate_detailed_report
-        return generate_detailed_report(result)
-    except Exception:
-        return "LLM summary unavailable."
+        # Run the graph synchronously
+        final_state = graph.invoke({}, config=config)
+        
+        # Return the structured feedback dictionary
+        return feedback(final_state)
+    
+    except Exception as e:
+        return {"final_score": 0.0, "sections": [{"section": "Pipeline Error", "score": 0, "text": f"Grader pipeline failed to execute: {e}"}], "conclusion": "❌ Grader failed due to a system error."}
+    
+    finally:
+        # Crucial: Clean up the run directory containing the source/executable files
+        if run_dir.exists():
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+# The summarize_with_llm function is not used by app.py's new logic, 
+# but kept here if other parts of the LangGraph implementation needed it.
+# def summarize_with_llm(result: GraderState):
+#     try:
+#         from llm_agents import generate_detailed_report
+#         return generate_detailed_report(result)
+#     except Exception:
+#         return "LLM summary unavailable."
