@@ -7,13 +7,15 @@ from typing import List, Dict, Any, Optional
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# Try to import google generative ai SDK if present
+# -------------------------------------------------------------------
+# Try to import Gemini SDK
+# -------------------------------------------------------------------
 try:
     import google.generativeai as genai
     GENAI_SDK = True
 except Exception:
     GENAI_SDK = False
-    logger.warning("google-generativeai not installed.")
+    logger.warning("google-generativeai not installed or unavailable.")
 
 # -------------------------------------------------------------------
 # Robust Gemini Caller with Automatic Model Fallback
@@ -43,7 +45,7 @@ def _call_gemini(prompt: str, max_output_tokens: int = 800) -> Optional[str]:
                 prompt, generation_config={"max_output_tokens": max_output_tokens}
             )
 
-            # Extract response text robustly across SDK versions
+            # Extract response text robustly
             if hasattr(response, "text") and response.text:
                 return response.text.strip()
             if hasattr(response, "candidates") and response.candidates:
@@ -52,7 +54,7 @@ def _call_gemini(prompt: str, max_output_tokens: int = 800) -> Optional[str]:
                 except Exception:
                     pass
 
-            logger.warning(f"Gemini {m} returned no text field: {str(response)[:300]}")
+            logger.warning(f"Gemini {m} returned no text field: {str(response)[:200]}")
         except Exception as e:
             logger.warning(f"Gemini model {m} failed: {e}")
             last_error = e
@@ -62,38 +64,46 @@ def _call_gemini(prompt: str, max_output_tokens: int = 800) -> Optional[str]:
     return None
 
 # -------------------------------------------------------------------
-# Test Case Generator
+# Deterministic Test-Case Generator
 # -------------------------------------------------------------------
 def generate_test_cases_with_logging(code_text: str, max_cases: int = 8) -> Dict[str, Any]:
     """
-    Attempt to generate test cases with Gemini or fallback heuristic.
+    Generate test cases for a C program using Gemini or heuristic fallback.
+    Returns {'status': 'ok'/'fallback', 'tests': [...], 'reason': '...'}
     """
-    prompt = (
-        "Generate up to {max} practical deterministic test cases for the following C program. "
-        "Return them in a compact format, one per line. Use either JSON list or 'input::expected' pairs.\n\nPROGRAM:\n"
-    ).format(max=max_cases) + code_text
+    prompt = f"""
+You are an automated C test case generator.
+
+Given the following C program, generate {max_cases} realistic input/output pairs.
+Each pair must be on a separate line using this format:
+
+<input_values>::<expected_output>
+
+Rules:
+- Do NOT include any explanations, headings, or comments.
+- Use realistic numeric inputs based on scanf format specifiers in the program.
+- The expected output must exactly match what printf would print.
+- Do not wrap the response in JSON or markdown.
+- Avoid quotes or code blocks.
+
+C program:
+{code_text}
+"""
 
     res_text = _call_gemini(prompt, max_output_tokens=400)
+
+    # Try parsing Gemini output
     if res_text:
-        try:
-            parsed = json.loads(res_text)
-            if isinstance(parsed, list):
-                tests = []
-                for item in parsed:
-                    if isinstance(item, dict):
-                        tests.append(f"{item.get('input','')}::{item.get('expected','')}")
-                    else:
-                        tests.append(str(item))
-                return {"status": "ok", "tests": tests[:max_cases], "reason": "parsed JSON list"}
-        except Exception:
-            pass
-
         lines = [ln.strip() for ln in res_text.splitlines() if ln.strip()]
+        # Filter out possible markdown/code block markers
+        lines = [ln for ln in lines if not ln.startswith("```") and "::" in ln]
         if lines:
-            return {"status": "ok", "tests": lines[:max_cases], "reason": "parsed plain lines from Gemini"}
+            logger.info(f"Gemini generated {len(lines)} test cases successfully.")
+            return {"status": "ok", "tests": lines[:max_cases], "reason": "Gemini test-case generation succeeded."}
 
-    # Fallback if LLM fails
+    # If Gemini failed or returned junk → fallback deterministic generator
     fallback_tests = _heuristic_test_gen(code_text, max_cases)
+    logger.warning("Gemini test-case generation failed. Using fallback heuristic.")
     return {"status": "fallback", "tests": fallback_tests, "reason": "Gemini not available or returned none; used heuristic fallback"}
 
 # -------------------------------------------------------------------
@@ -104,6 +114,13 @@ def _heuristic_test_gen(code_text: str, max_cases: int = 6) -> List[str]:
     out = []
     if "scanf" in code and "printf" in code and "+" in code:
         out = ["2 3::5", "10 20::30", "-1 1::0", "0 0::0"]
+    elif "largest" in code and "if" in code:
+        out = [
+            "2 3 1::3.00 is the largest number.",
+            "5 8 7::8.00 is the largest number.",
+            "10 2 3::10.00 is the largest number.",
+            "-5 -2 -10::-2.00 is the largest number."
+        ]
     elif "factorial" in code:
         out = ["3::6", "5::120", "0::1"]
     elif "reverse" in code:
@@ -111,24 +128,28 @@ def _heuristic_test_gen(code_text: str, max_cases: int = 6) -> List[str]:
     elif "prime" in code:
         out = ["2::prime", "4::not prime", "17::prime"]
     else:
-        out = ["input1::input1", "hello::hello", "42::42"]
+        out = ["1::1", "2::2", "3::3"]
     return out[:max_cases]
 
 # -------------------------------------------------------------------
 # LLM Report Generator
 # -------------------------------------------------------------------
 def generate_detailed_report(evaluation: Dict[str, Any]) -> str:
+    """
+    Generate a structured evaluation report using Gemini, or fallback if unavailable.
+    """
     prompt = (
-        "You are an experienced C instructor. Using ONLY the JSON below, write a structured report: "
-        "Summary, Compilation, Static Analysis, Functional Tests, Performance, Recommendations. "
-        "Do NOT alter numeric scores.\n\nJSON:\n" + json.dumps(evaluation, indent=2)
+        "You are an expert C instructor. Based on the evaluation JSON below, write a structured report with these sections:\n"
+        "Summary, Compilation, Static Analysis, Functional Tests, Performance, and Recommendations.\n"
+        "Do NOT change numeric values or results. Keep tone analytical and professional.\n\n"
+        "Evaluation JSON:\n" + json.dumps(evaluation, indent=2)
     )
 
     res = _call_gemini(prompt, max_output_tokens=900)
     if res:
         return res
 
-    # Fallback report
+    # Fallback text report
     lines = ["FALLBACK REPORT — LLM not available"]
     lines.append(f"Final Score: {evaluation.get('final_score', 'N/A')}")
     comp = evaluation.get("compile", {})
@@ -143,5 +164,5 @@ def generate_detailed_report(evaluation: Dict[str, Any]) -> str:
         lines.append("- " + str(it))
     test = evaluation.get("test", {})
     lines.append(f"Tests passed: {test.get('passed', 0)} / {test.get('total', 0)}")
-    lines.append("Recommendations: Fix compile errors, resolve cppcheck warnings, and recheck I/O format.")
+    lines.append("Recommendations: Address static warnings, verify I/O format, and optimize logic as needed.")
     return "\n".join(lines)
