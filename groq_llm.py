@@ -1,29 +1,30 @@
-# openai_oss_llm.py
+# groq_llm.py
 import os
 import requests
 import logging
+import json
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-def generate_test_cases_with_openai_oss(code_text: str, max_cases: int = 8) -> dict:
+def generate_test_cases_with_groq(code_text: str, max_cases: int = 8) -> dict:
     """
-    Generate test cases using OpenAI OSS 20B (gpt-oss-20b) model.
+    Generate test cases using Groq API (model: openai/gpt-oss-20b).
+    Uses completion-style request schema instead of chat schema.
     """
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         return {"status": "error", "tests": [], "reason": "GROQ_API_KEY missing"}
 
     prompt = f"""
-You are a precise C test case generator.
+You are a precise test case generator for C programs.
 
-Analyze the following C program and produce up to {max_cases} realistic test cases
-to verify its correctness.
+Analyze the following code and produce up to {max_cases} test cases to verify its correctness.
 
-Each line should be formatted exactly as:
+Each test case should be one line:
 <input_values>::<expected_output>
 
-Do not include explanations, markdown, or comments.
+Use numeric examples. No markdown, no explanations.
 
 C program:
 {code_text}
@@ -36,35 +37,38 @@ C program:
         }
 
         payload = {
-            "model": "gpt-oss-20b",
-            "messages": [
-                {"role": "system", "content": "You are a C program test-case generator."},
-                {"role": "user", "content": prompt}
-            ],
+            "model": "openai/gpt-oss-20b",
+            "prompt": prompt,
             "temperature": 0.2,
-            "max_tokens": 500
+            "max_tokens": 400
         }
 
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
+        response = requests.post(
+            "https://api.groq.com/openai/v1/completions",
             headers=headers,
             json=payload,
             timeout=40
         )
 
-        if resp.status_code == 200:
-            data = resp.json()
-            content = data["choices"][0]["message"]["content"].strip()
-            lines = [ln.strip() for ln in content.splitlines() if "::" in ln]
-            if lines:
-                logger.info(f"OSS 20B produced {len(lines)} test cases.")
-                return {"status": "ok", "tests": lines[:max_cases], "reason": "OSS 20B test generation successful"}
-            else:
-                logger.warning("OSS 20B returned text but no test cases.")
-        else:
-            logger.error(f"OSS API error {resp.status_code}: {resp.text[:200]}")
+        logger.info(f"Groq API status: {response.status_code}")
+        if response.status_code != 200:
+            logger.error(f"Groq error: {response.text[:300]}")
+            return {"status": "error", "tests": [], "reason": f"Groq error {response.status_code}"}
+
+        data = response.json()
+        text = data.get("choices", [{}])[0].get("text", "").strip()
+        if not text:
+            logger.error(f"Groq OSS 20B returned no text. Full response: {json.dumps(data, indent=2)[:300]}")
+            return {"status": "error", "tests": [], "reason": "Empty response from Groq"}
+
+        lines = [ln.strip() for ln in text.splitlines() if "::" in ln]
+        if lines:
+            logger.info(f"Groq OSS 20B produced {len(lines)} test cases.")
+            return {"status": "ok", "tests": lines[:max_cases], "reason": "Groq OSS 20B test generation successful"}
+
+        logger.warning("Groq OSS 20B response had no valid test lines.")
+        return {"status": "error", "tests": [], "reason": "No '::' formatted lines found"}
 
     except Exception as e:
-        logger.error(f"OSS test generation failed: {e}")
-
-    return {"status": "fallback", "tests": [], "reason": "OSS 20B returned none or failed"}
+        logger.error(f"Groq OSS 20B request failed: {e}")
+        return {"status": "error", "tests": [], "reason": str(e)}
