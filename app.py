@@ -6,39 +6,52 @@ from llm_agents import (
     generate_test_cases,
     fallback_code_evaluation,
     generate_detailed_report,
-    create_pdf_report
+    create_pdf_report,
 )
 
-# ----------------- Streamlit UI Setup ----------------- #
-st.set_page_config(page_title="AI C Autograder", layout="wide")
-st.title("🤖 AI-Powered C Autograder (Gemini + LangGraph)")
+# ---------------- Streamlit Page Setup ---------------- #
+st.set_page_config(page_title="AI C Autograder (Gemini 2.5 Flash)", layout="wide")
+st.title("🤖 AI-Powered C Autograder – Gemini 2.5 Flash Edition")
 
 st.markdown(
     """
-This tool uses **Google Gemini (via LangChain)** to:
-1. Automatically generate **test cases** for your C program  
-2. Compile and run it against those test cases  
-3. Create a **detailed report** with performance feedback  
-4. If test cases can’t be generated, perform **AI-based static evaluation**
+### 🧠 Features
+1. Auto-generate **test cases** for your C code  
+2. Compile & run it against those cases  
+3. Create a **detailed Gemini report**  
+4. If no test cases can be generated → perform **static evaluation**
 """
 )
 
-uploaded_file = st.file_uploader("📂 Upload your `.c` file for grading", type=["c"])
+# ---------------- Gemini Connection Test ---------------- #
+if st.button("🔍 Test Gemini 2.5 Flash Connection"):
+    import google.generativeai as genai
 
-if uploaded_file is not None:
+    try:
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        resp = model.generate_content("Say 'Gemini 2.5 Flash connected successfully!'")
+        st.success(resp.text)
+    except Exception as e:
+        st.error(f"Connection failed: {e}")
+
+st.divider()
+
+# ---------------- File Upload ---------------- #
+uploaded_file = st.file_uploader("📂 Upload your C file", type=["c"])
+
+if uploaded_file:
     code_text = uploaded_file.read().decode("utf-8")
     st.code(code_text, language="c")
 
-    # Step 1: Generate test cases (with spinner)
-    with st.spinner("🧠 Generating test cases using Gemini..."):
+    with st.spinner("🧠 Generating test cases using Gemini 2.5 Flash..."):
         test_cases = generate_test_cases(code_text)
 
+    # ---------- Case 1 – Normal test-based flow ---------- #
     if test_cases:
         st.success("✅ Test cases generated successfully.")
-        st.write("### 🧩 Generated Test Cases")
         st.json(test_cases)
 
-        # Step 2: Compile and run the C program
         with open("submitted_code.c", "w") as f:
             f.write(code_text)
 
@@ -58,7 +71,6 @@ if uploaded_file is not None:
             else:
                 st.success("✅ Compilation successful! Running test cases...")
                 results = []
-
                 for case in test_cases:
                     try:
                         process = subprocess.run(
@@ -66,61 +78,61 @@ if uploaded_file is not None:
                             input=case["input"],
                             text=True,
                             capture_output=True,
-                            timeout=3
+                            timeout=3,
                         )
-                        results.append({
-                            "input": case["input"],
-                            "expected_output": case["expected_output"],
-                            "actual_output": process.stdout.strip(),
-                            "passed": process.stdout.strip() == case["expected_output"].strip()
-                        })
+                        actual_output = process.stdout.strip()
+                        expected_output = case["expected_output"].strip()
+                        results.append(
+                            {
+                                "input": case["input"],
+                                "expected_output": expected_output,
+                                "actual_output": actual_output,
+                                "passed": actual_output == expected_output,
+                            }
+                        )
                     except subprocess.TimeoutExpired:
-                        results.append({
-                            "input": case["input"],
-                            "error": "Execution timed out",
-                            "passed": False
-                        })
+                        results.append(
+                            {
+                                "input": case["input"],
+                                "error": "Execution timed out",
+                                "passed": False,
+                            }
+                        )
                     except Exception as e:
-                        results.append({
-                            "input": case["input"],
-                            "error": str(e),
-                            "passed": False
-                        })
+                        results.append(
+                            {"input": case["input"], "error": str(e), "passed": False}
+                        )
 
                 st.write("### 🧾 Test Case Results")
                 st.json(results)
 
-                # Step 3: Generate detailed report
                 with st.spinner("📝 Generating performance report..."):
                     report_text = generate_detailed_report(code_text, results)
 
         except Exception as e:
             st.error(f"Runtime error: {e}")
-            report_text = f"Runtime error occurred: {e}"
+            report_text = f"Runtime error: {e}"
 
+    # ---------- Case 2 – Fallback Static Evaluation ---------- #
     else:
-        # ------------------ Fallback System ------------------ #
-        st.warning("⚠️ Unable to generate valid test cases. Switching to AI static evaluation.")
-        with st.spinner("🧩 Performing static analysis via Gemini..."):
+        st.warning("⚠️ Unable to generate valid test cases. Switching to AI Static Evaluation Mode.")
+        with st.spinner("🧩 Performing static analysis..."):
             report_text = fallback_code_evaluation(code_text)
 
-    # Step 4: Show report (whether from test results or fallback)
+    # ---------- Final Report and Download ---------- #
     if report_text:
         st.subheader("📘 Final Report")
         st.text_area("Gemini Evaluation Report", report_text, height=400)
 
-        # Step 5: PDF Download Option
         with st.spinner("📄 Preparing downloadable report..."):
-            pdf_path = create_pdf_report(report_text)
+            pdf_buf = create_pdf_report(report_text)
 
-        with open(pdf_path, "rb") as f:
-            st.download_button(
-                label="📥 Download Report as PDF",
-                data=f,
-                file_name="grading_report.pdf",
-                mime="application/pdf",
-            )
+        st.download_button(
+            label="📥 Download Report as PDF",
+            data=pdf_buf,
+            file_name="grading_report.pdf",
+            mime="application/pdf",
+        )
 
-# ------------------ Footer ------------------ #
-st.markdown("---")
-st.caption("🔹 Developed with LangChain, Gemini 2.5 Flash, and Streamlit Cloud.")
+st.divider()
+st.caption("🔹 Built with Streamlit · Gemini 2.5 Flash · LangGraph 2025")
