@@ -1,109 +1,151 @@
+"""
+App.py - Streamlit UI
+
+This file is the front-end for the autograder. It accepts C code (paste/upload),
+optional test cases (one per line, in format input::expected_output), runs the
+grading pipeline and displays results.
+
+WARNING: The grader pipeline compiles and runs submitted C code on the host by default.
+Do NOT run this Streamlit app on an unprotected host with untrusted users. Use Docker or other sandbox.
+"""
+
 import streamlit as st
-import os
-import json
-from llm_agents import (
-    generate_test_cases,
-    generate_detailed_report,
-    create_pdf_report,
-)
-from grader_langgraph import run_grader_pipeline
-from typing import Dict, List
+from typing import List
+import logging
+import io
+import textwrap
 
-# ---------------- Streamlit Page Setup ---------------- #
-st.set_page_config(page_title="AI C Autograder (Execution & Analysis)", layout="wide")
-st.title("🤖 AI-Powered C Autograder")
-st.caption("Execution powered by GCC/CppCheck and coordinated by LangGraph Agents. Reporting by Gemini 2.5 Flash.")
+# Import the pipeline modules (they use logging, not Streamlit)
+import grader_langgraph as grader
+import llm_agents
 
+# Configure logging to show in console
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+st.set_page_config(page_title="C Autograder", layout="wide")
+
+st.title("C Autograder (Safe Mode Warning)")
 st.markdown(
     """
-### 🧠 Analysis Workflow
-1.  **Test Cases (Gemini):** Generates structured test cases (`input`/`output`).
-2.  **Execution (LangGraph):** Compiles code, runs tests, performs static analysis, and checks performance.
-3.  **Final Report (Gemini):** Synthesizes all execution and analysis data into a detailed, human-readable report.
-"""
+    **Important:** This demo compiles and runs submitted C code using `gcc` and subprocess.
+    For local testing only. **Do not** deploy this on a production host without proper sandboxing.
+    """
 )
-st.divider()
 
-# ---------------- Step 1: Code Input (Upload or Write) ---------------- #
+with st.sidebar:
+    st.header("Options")
+    show_raw = st.checkbox("Show raw pipeline output", value=False)
+    use_llm_for_tests = st.checkbox("Auto-generate tests using LLM (if available)", value=False)
+    generate_llm_report = st.checkbox("Generate detailed LLM report (if available)", value=True)
+    max_tests = st.number_input("Max auto testcases", min_value=1, max_value=12, value=6)
+
+st.header("Submit C source code")
+uploaded = st.file_uploader("Upload C file (.c) or paste code below", type=["c", "txt"])
 code_text = ""
-st.subheader("1. Provide Your C Code")
+if uploaded is not None:
+    try:
+        code_bytes = uploaded.read()
+        code_text = code_bytes.decode("utf-8")
+    except Exception:
+        # fallback
+        code_text = str(uploaded.getvalue())
 
-tab1, tab2 = st.tabs(["📂 Upload C File", "✏️ Write/Paste Code"])
+code_text_area = st.text_area("C source code", value=code_text, height=300)
 
-with tab1:
-    uploaded_file = st.file_uploader("Upload your .c file", type=["c"])
-    if uploaded_file:
-        code_text = uploaded_file.read().decode("utf-8")
-        st.code(code_text, language="c")
+st.markdown("---")
+st.header("Testcases (one per line, format: input::expected_output)")
+tests_text = st.text_area("Optional: provide tests (leave empty to auto-generate)", value="", height=150)
+run_btn = st.button("Run Autograder")
 
-with tab2:
-    pasted_code = st.text_area("Write or paste your C code here:", height=300, placeholder="#include <stdio.h>\n\nint main() {\n    // Your code here\n    return 0;\n}")
-    if pasted_code:
-        code_text = pasted_code
+def parse_tests_from_text(t: str) -> List[str]:
+    out = []
+    for line in t.splitlines():
+        s = line.strip()
+        if s:
+            out.append(s)
+    return out
 
-# ---------------- Main Analysis Button ---------------- #
-st.divider()
-if st.button("🚀 Run Full Analysis Pipeline", type="primary", use_container_width=True):
-    if not code_text.strip():
-        st.error("Please upload or write some C code to analyze.")
-        st.stop()
-    
-    # ---------------- Step 2: Generate Test Cases (Gemini) ---------------- #
-    st.subheader("2. Generated Test Cases")
-    tests: List[Dict[str, str]] = []
-    with st.spinner("🧠 Gemini is generating structured test cases..."):
-        tests = generate_test_cases(code_text)
-    
-    if not tests:
-        st.warning("⚠️ Could not generate structured test cases. Running static analysis only.")
+if run_btn:
+    code_to_grade = code_text_area.strip()
+    if not code_to_grade:
+        st.error("Please provide C source code either by uploading a .c file or pasting in the textbox.")
     else:
-        st.info(f"Generated {len(tests)} test cases for execution.")
-        st.json(tests)
+        st.info("Starting grading pipeline...")
+        # Prepare tests: either user-provided or LLM-generated (if available)
+        user_tests = parse_tests_from_text(tests_text or "")
+        if not user_tests and use_llm_for_tests:
+            st.info("Requesting testcases from LLM...")
+            generated = llm_agents.generate_test_cases(code_to_grade)
+            if generated:
+                # respect max_tests setting
+                generated = generated[:max_tests]
+                st.success(f"LLM returned {len(generated)} testcases.")
+                user_tests = generated
+            else:
+                st.warning("LLM could not generate testcases. Please provide tests manually.")
+        # Final tests list
+        tests_list = user_tests
 
-    st.divider()
-    
-    # ---------------- Step 3: Run Full Execution Pipeline (LangGraph) ---------------- #
-    st.subheader("3. Execution & Static Analysis (LangGraph)")
-    structured_results = {}
-    
-    with st.spinner("🤖 LangGraph agents are compiling, testing, and analyzing your code... (This will take a few moments)"):
-        # Run the LangGraph execution and grading pipeline
-        structured_results = run_grader_pipeline(code_text, tests)
-        
-    final_score = structured_results.get("final_score", 0.0)
-    st.markdown(f"## **Final Overall Score: {final_score:.2f}%**")
-    st.markdown(f"**Conclusion:** {structured_results.get('conclusion', 'Analysis complete.')}")
-    
-    st.write("---")
-    st.markdown("### Detailed Section Scores")
-    
-    for section_data in structured_results.get("sections", []):
-        score_pct = section_data.get("score", 0)
-        st.markdown(f"#### **{section_data['section']}** ({score_pct:.1f}%)")
-        st.code(section_data['text'], language='markdown')
+        # Run pipeline
+        try:
+            # llm_reporter: pass llm_agents.generate_detailed_report only if requested
+            llm_reporter = llm_agents.generate_detailed_report if generate_llm_report else None
+            results = grader.run_grader_pipeline(code_to_grade, tests=tests_list, llm_reporter=llm_reporter)
+        except Exception as e:
+            st.error(f"Grading pipeline failed: {e}")
+            results = {"error": str(e)}
 
-    st.divider()
+        # Show results
+        if show_raw:
+            st.subheader("Raw pipeline output")
+            st.json(results)
 
-    # ---------------- Step 4: Final Report (Gemini) ---------------- #
-    st.subheader("4. Final Detailed Report (from Gemini)")
-    
-    with st.spinner("📝 Gemini is writing the final, human-readable report with code suggestions..."):
-        final_report = generate_detailed_report(code_text, structured_results)
-        st.text_area("Gemini Evaluation Report", final_report, height=600)
-            
-        # ---------------- Step 5: PDF Download ---------------- #
-        st.divider()
-        st.subheader("5. Download Report")
-        with st.spinner("📄 Preparing downloadable report..."):
-            pdf_buf = create_pdf_report(final_report)
+        st.subheader("Summary")
+        if results.get("error"):
+            st.error(f"Pipeline error: {results.get('error')}")
+        else:
+            final_score = results.get("final_score")
+            if final_score is not None:
+                st.metric("Final Score", f"{final_score} / 100")
+            compile_info = results.get("compile") or {}
+            if compile_info.get("status") == "success":
+                st.success("Compilation: success")
+            else:
+                st.error("Compilation: failed")
+                st.code(compile_info.get("stderr", "No compiler stderr available."))
 
-        st.download_button(
-            label="📥 Download Full Report as PDF",
-            data=pdf_buf,
-            file_name="C_Code_Analysis_Report.pdf",
-            mime="application/pdf",
-            use_container_width=True
-        )
+            st.markdown("### Static analysis")
+            st.write(results.get("static"))
 
-st.divider()
-st.caption("🔹 Built with Streamlit · Gemini 2.5 Flash · LangGraph")
+            st.markdown("### Tests")
+            test_info = results.get("test") or {}
+            st.write(test_info)
+            if test_info.get("results"):
+                with st.expander("Detailed test results"):
+                    for idx, r in enumerate(test_info["results"]):
+                        st.write(f"Test #{idx+1}")
+                        st.write(r)
+
+            st.markdown("### Performance")
+            st.write(results.get("perf"))
+
+            st.markdown("### Detailed report")
+            report_text = results.get("report") or "No report generated."
+            st.text_area("Report", value=report_text, height=300)
+
+            # Offer download of report as text file
+            report_bytes = report_text.encode("utf-8")
+            st.download_button("Download report (.txt)", data=report_bytes, file_name="grading_report.txt", mime="text/plain")
+
+            # Cleanup: inform user where binary (if any) is left
+            compile_out = results.get("compile") or {}
+            binary_path = compile_out.get("binary_path")
+            if binary_path:
+                st.warning("A compiled binary exists on the server at: %s" % binary_path)
+                st.markdown(
+                    "⚠️ For safety, manually delete temporary compilation directories on the host or add cleanup logic in the pipeline."
+                )
+
+st.markdown("---")
+st.caption("This is a development/demo autograder. For production use, implement robust sandboxing and monitoring.")
