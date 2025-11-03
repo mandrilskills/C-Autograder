@@ -1,23 +1,10 @@
-# ---- Streamlit App ----
 streamlit==1.38.0
-
-# ---- LangChain Ecosystem ----
-langchain==0.2.14
-langchain-core==0.2.36
-langchain-community==0.2.11
-
-# ---- Google Gemini Integration ----
-langchain-google-genai==1.0.6
-google-generativeai==0.8.3 
-
-# ---- LangGraph (for agent orchestration) ----
-langgraph
-
-# ---- PDF & Environment Tools ----
+google-generativeai==0.8.3
+langgraph==0.2.21
 reportlab==4.2.2
 python-dotenv==1.0.1
-
-# ---- Async Utilities ----
 aiofiles
 asyncio
+langgraph
+
 
