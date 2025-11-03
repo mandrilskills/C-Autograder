@@ -1,2 +1,4 @@
 gcc
+g++
 cppcheck
+make
