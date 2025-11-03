@@ -81,17 +81,16 @@ if run_btn:
         st.info("🔍 Starting grading pipeline...")
 
         # Step 1: Prepare test cases
-        user_tests = parse_tests_from_text(tests_text)
-        if not user_tests and use_llm_for_tests:
-            st.info("Requesting test cases from LLM...")
-            generated = llm_agents.generate_test_cases(code_to_grade)
-            if generated:
-                user_tests = generated[:max_tests]
-                st.success(f"✅ LLM generated {len(user_tests)} test cases.")
-            else:
-                st.warning("LLM could not generate test cases. Please provide them manually.")
+user_tests = parse_tests_from_text(tests_text)
+if not user_tests and use_llm_for_tests:
+    st.info("Requesting test cases from LLM or fallback generator...")
+    generated = llm_agents.generate_test_cases(code_to_grade)
+    if generated:
+        user_tests = generated[:max_tests]
+        st.success(f"✅ Generated {len(user_tests)} test cases automatically.")
+    else:
+        st.warning("❌ Could not generate test cases. Please provide them manually.")
 
-        tests_list = user_tests
 
         # Step 2: Run the grading pipeline
         try:
@@ -152,3 +151,4 @@ if run_btn:
 
 st.markdown("---")
 st.caption("© 2025 C Autograder | Developed for educational evaluation of C programming assignments.")
+
