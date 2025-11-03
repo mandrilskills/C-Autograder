@@ -44,6 +44,7 @@ def call_gemini(prompt, timeout=60):
         candidate = response.candidates[0]
         
         # 2. Check finish reason if text is missing (handling the reported error)
+        # This is the critical fix for the finish_reason: SAFETY error
         if not response.text:
             reason_name = candidate.finish_reason.name
             
@@ -116,6 +117,7 @@ def simulate_test_execution(c_code: str, test_cases: list):
     """
     Uses Gemini to simulate running the C code against the generated test cases
     and determine the PASS/FAIL status.
+    (Note: This function is not used by the current app.py but is here for completeness)
     """
     st.info("🧪 Simulating test execution and marking results (LLM Simulation)...")
 
@@ -253,3 +255,4 @@ def create_pdf_report(report_text: str):
     c.save()
     buf.seek(0)
     return buf
+
