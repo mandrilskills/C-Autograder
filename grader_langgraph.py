@@ -97,9 +97,14 @@ def static_analysis(src_path: str) -> Dict[str, Any]:
         issues.append(f"Static analysis error: {e}")
     return {"count": len(issues), "issues": issues}
 
-def run_tests(binary: str, tests: List[Dict[str, str]], timeout: int = 3) -> Dict[str, Any]:
+def run_tests(binary: str, tests: List[Dict[str, str]], timeout: int = 5) -> Dict[str, Any]:
+    """
+    Execute compiled binary on each test input.
+    Timeout per test is configurable (default 5s).
+    Does not crash pipeline on timeout — just marks test as timed out.
+    """
     if not binary:
-        return {"status": "error", "results": []}
+        return {"status": "error", "results": [], "passed": 0, "total": len(tests), "score": 0}
 
     results, passed = [], 0
     for t in tests:
@@ -113,22 +118,47 @@ def run_tests(binary: str, tests: List[Dict[str, str]], timeout: int = 3) -> Dic
                 timeout=timeout
             )
             out = proc.stdout.decode().strip()
-            success = (exp.strip() == "" or out == exp.strip())
+            success = (not exp.strip()) or (out == exp.strip())
             results.append({
                 "input": inp,
                 "expected": exp,
                 "actual": out,
                 "stderr": proc.stderr.decode().strip(),
-                "success": success
+                "success": success,
+                "comment": "OK" if success else "Output mismatch"
             })
             if success:
                 passed += 1
+
         except subprocess.TimeoutExpired:
-            results.append({"input": inp, "expected": exp, "actual": "(timeout)", "stderr": "", "success": False})
+            results.append({
+                "input": inp,
+                "expected": exp,
+                "actual": "(timeout)",
+                "stderr": "",
+                "success": False,
+                "comment": f"Program timed out after {timeout}s (possible infinite loop or missing input)"
+            })
+
         except Exception as e:
-            results.append({"input": inp, "expected": exp, "actual": "", "stderr": str(e), "success": False})
-    score = round((passed / len(tests) * 100), 2) if tests else 0
-    return {"status": "done", "passed": passed, "total": len(tests), "results": results, "score": score}
+            results.append({
+                "input": inp,
+                "expected": exp,
+                "actual": "",
+                "stderr": str(e),
+                "success": False,
+                "comment": "Runtime error"
+            })
+
+    total = len(tests)
+    score = round((passed / total * 100), 2) if total > 0 else 0
+    return {
+        "status": "done",
+        "passed": passed,
+        "total": total,
+        "results": results,
+        "score": score
+    }
 
 def measure_performance(binary: str) -> Dict[str, Any]:
     if not binary:
@@ -197,3 +227,4 @@ def run_grader_pipeline(code_text: str, tests_raw: Any, llm_reporter=None):
         "report": report,
         "pdf_bytes": pdf_bytes
     }
+
