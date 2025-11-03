@@ -21,7 +21,10 @@ except:
     pass # Continue without env variable if running in Canvas
 
 def call_gemini(prompt, timeout=60):
-    """Safely call Gemini 2.5 Flash with content extraction."""
+    """
+    Safely call Gemini 2.5 Flash with content extraction and robust error checking
+    for cases where content is blocked (finish_reason 2).
+    """
     try:
         model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content(
@@ -33,19 +36,34 @@ def call_gemini(prompt, timeout=60):
             },
         )
 
-        # --- Safely extract text ---
-        if hasattr(response, "text") and response.text:
-            return response.text.strip()
+        # 1. Check for blocked/empty candidates first
+        if not response.candidates:
+            st.error("🛑 Gemini generation failed: No candidates returned.")
+            return None
 
-        if hasattr(response, "candidates") and response.candidates:
-            parts = response.candidates[0].content.parts
-            if parts and hasattr(parts[0], "text"):
-                return parts[0].text.strip()
+        candidate = response.candidates[0]
+        
+        # 2. Check finish reason if text is missing (handling the reported error)
+        if not response.text:
+            reason_name = candidate.finish_reason.name
+            
+            if reason_name == 'SAFETY':
+                # This handles the reported 'finish_reason 2' error (SAFETY)
+                st.error("🛑 Generation was blocked due to safety policy. Please adjust the input or prompt.")
+                return None
+            elif reason_name != 'STOP':
+                st.error(f"🛑 Generation stopped prematurely. Finish Reason: {reason_name}.")
+                return None
+
+        # 3. Safely extract text (if available)
+        if response.text:
+            return response.text.strip()
 
         st.warning("⚠️ Gemini 2.5 Flash returned no textual output.")
         return None
 
     except Exception as e:
+        # Catch network errors, timeouts, and other API exceptions
         st.error(f"Gemini 2.5 Flash call failed: {e}")
         return None
 
@@ -76,7 +94,6 @@ Return your answer **only** as a JSON array in this format:
 {c_code}
 ```
 """
-    # The call to gemini must be outside the prompt f-string
     response_text = call_gemini(prompt)
     if not response_text:
         return []
@@ -236,112 +253,3 @@ def create_pdf_report(report_text: str):
     c.save()
     buf.seek(0)
     return buf
-
-
-# ---------------- Streamlit Main App Logic ---------------- #
-
-def main():
-    st.set_page_config(page_title="Gemini C Code Examiner", layout="wide")
-    st.title("👨‍💻 C Code Examiner powered by Gemini")
-    st.markdown("Enter your C code below to automatically generate test cases, simulate execution, and receive a detailed evaluation report.")
-
-    st.sidebar.header("Instructions")
-    st.sidebar.markdown(
-        """
-        1. Paste your C code (with `main` function) into the editor.
-        2. Click **Generate Test Report**.
-        3. Gemini will generate test cases, simulate the execution, and provide a full analysis.
-        """
-    )
-
-    default_code = """
-#include <stdio.h>
-
-int factorial(int n) {
-    if (n <= 1) {
-        return 1;
-    }
-    return n * factorial(n - 1);
-}
-
-int main() {
-    int num;
-    printf("Enter a non-negative integer: ");
-    if (scanf("%d", &num) != 1 || num < 0) {
-        return 1; // Error
-    }
-    printf("%d\\n", factorial(num));
-    return 0;
-}
-"""
-    c_code = st.text_area(
-        "Paste C Code Here (must include main()):",
-        value=default_code,
-        height=300
-    )
-
-    if st.button("Generate Test Report 🚀", use_container_width=True, type="primary"):
-        if not c_code.strip():
-            st.error("Please paste your C code before generating a report.")
-            return
-
-        with st.spinner("Processing C Code with Gemini..."):
-            # 1. Generate Test Cases
-            test_cases = generate_test_cases(c_code)
-
-            if not test_cases:
-                # Fallback to Static Evaluation if JSON parsing fails
-                st.subheader("Static Code Review (Fallback Mode)")
-                report = fallback_code_evaluation(c_code)
-                st.markdown(report)
-                return
-
-            # 2. Simulate Execution using the LLM
-            st.subheader("Test Cases Generated and Simulated")
-            st.markdown(f"**Total Tests:** `{len(test_cases)}`")
-            st.json(test_cases) # Show the raw generated cases first
-
-            execution_results = simulate_test_execution(c_code, test_cases)
-            
-            if not execution_results:
-                st.error("Simulation failed. Check the code and try again.")
-                return
-
-            # 3. Display Execution Results in a clear table
-            st.markdown("---")
-            st.subheader("Execution Summary")
-            
-            passes = sum(1 for r in execution_results if r.get('result') == 'PASS')
-            fails = len(execution_results) - passes
-            
-            st.markdown(f"**{passes}/{len(execution_results)} tests passed.**")
-            
-            display_results = [
-                {
-                    "Result": f"**{'✅ PASS' if r.get('result') == 'PASS' else '❌ FAIL'}**",
-                    "Input": r.get('input').replace('\n', '\\n'),
-                    "Expected Output": r.get('expected_output').replace('\n', '\\n'),
-                    "Actual Output": r.get('actual_output').replace('\n', '\\n'),
-                }
-                for r in execution_results
-            ]
-            st.dataframe(display_results, use_container_width=True)
-
-            # 4. Generate Detailed Report
-            st.markdown("---")
-            report = generate_detailed_report(c_code, execution_results)
-            st.subheader("Detailed Examination Report")
-            st.markdown(report)
-
-            # 5. Create PDF download button
-            pdf_buffer = create_pdf_report(report)
-            st.download_button(
-                label="Download PDF Report 📄",
-                data=pdf_buffer,
-                file_name="c_code_examination_report.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-
-if __name__ == '__main__':
-    main()
