@@ -1,55 +1,24 @@
-# llm_agents.py
+# llm_agents_langchain.py
 import os
 import logging
-import google.generativeai as genai
-from groq_llm import generate_test_cases_with_groq
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.exceptions import OutputParserException
+from langchain_core.output_parsers import JsonOutputParser
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ---------------- GEMINI SETUP ----------------
-def configure_gemini():
-    api_key = os.getenv("GENAI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise EnvironmentError("Gemini API key not found.")
-    genai.configure(api_key=api_key)
+# ---------------- API KEY CHECK (Optional but Recommended) ----------------
+# LangChain loads these automatically, but checking helps debugging.
+if not os.getenv("GOOGLE_API_KEY"):
+    logger.warning("GOOGLE_API_KEY environment variable not set.")
+if not os.getenv("GROQ_API_KEY"):
+    logger.warning("GROQ_API_KEY environment variable not set.")
 
 
-def _call_gemini(prompt: str, max_output_tokens=900) -> str:
-    """Internal Gemini 2.5 Flash call."""
-    try:
-        configure_gemini()
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        # safer list format for compatibility
-        response = model.generate_content([prompt],
-            generation_config={"max_output_tokens": max_output_tokens})
-        if hasattr(response, "text") and response.text:
-            return response.text.strip()
-        # capture blocked or empty cases
-        meta = getattr(response, "prompt_feedback", "No feedback metadata.")
-        logger.warning(f"Gemini returned no text. Metadata: {meta}")
-    except Exception as e:
-        logger.warning(f"Gemini 2.5 Flash failed: {e}")
-    return None
-
-
-# ---------------- TEST CASE GENERATION (Groq OSS 20B) ----------------
-def generate_test_cases_with_logging(code_text: str, max_cases: int = 8) -> dict:
-    """Uses Groq API (model: openai/gpt-oss-20b) for test case generation."""
-    for attempt in range(2):
-        res = generate_test_cases_with_groq(code_text, max_cases)
-        if res["status"] == "ok" and res["tests"]:
-            logger.info(f"Groq OSS 20B succeeded on attempt {attempt+1}")
-            return res
-        logger.warning(f"Groq OSS 20B attempt {attempt+1} failed: {res['reason']}")
-    return {
-        "status": "fallback",
-        "tests": _heuristic_test_gen(code_text, max_cases),
-        "reason": "Groq OSS 20B failed twice; heuristic fallback used",
-    }
-
-
-# ---------------- HEURISTIC FALLBACK ----------------
+# ---------------- HEURISTIC FALLBACK (Unchanged) ----------------
 def _heuristic_test_gen(code_text: str, max_cases: int = 5):
     code = code_text.lower()
     if "largest" in code:
@@ -67,12 +36,22 @@ def _heuristic_test_gen(code_text: str, max_cases: int = 5):
         return ["1::1", "2::2"]
 
 
-# ---------------- GEMINI REPORT GENERATION ----------------
+# ---------------- GEMINI REPORT GENERATION (LangChain) ----------------
 def generate_llm_report(evaluation: dict) -> str:
-    """Generate detailed evaluation report using Gemini 2.5 Flash."""
-    prompt = f"""
+    """Generate detailed evaluation report using Gemini 2.5 Flash via LangChain."""
+    
+    # CRITICAL FIX: Use the correct model name 'gemini-2.5-flash'
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash",
+            max_output_tokens=900,
+            # Good practice for Gemini to handle system prompts
+            convert_system_message_to_human=True 
+        )
+        
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", """
 You are an expert C programming evaluator.
-
 Analyze the following evaluation JSON and write a structured report with:
 1. Summary
 2. Compilation Details
@@ -80,22 +59,89 @@ Analyze the following evaluation JSON and write a structured report with:
 4. Functional Testing
 5. Performance Evaluation
 6. Recommendations
+"""),
+            ("human", "Evaluation JSON:\n{eval_json_str}")
+        ])
+        
+        chain = prompt_template | llm
+        
+        report = chain.invoke({"eval_json_str": str(evaluation)})
+        
+        return report.content or "(LLM report generation failed: Gemini returned empty content.)"
 
-Evaluation JSON:
-{evaluation}
-"""
-    report = _call_gemini(prompt)
-    return report or "(LLM report generation failed — Gemini 2.5 Flash returned empty.)"
-
-
-def test_gemini_connection() -> str:
-    """Quick diagnostic for Gemini 2.5 Flash."""
-    try:
-        configure_gemini()
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content(["Say 'Gemini 2.5 Flash connection successful.'"])
-        if hasattr(response, "text") and response.text:
-            return f"Gemini 2.5 Flash Response: {response.text.strip()}"
-        return f"Gemini reachable but empty. Metadata: {getattr(response, 'prompt_feedback', 'No feedback')}"
     except Exception as e:
-        return f"Gemini 2.5 Flash connection failed: {e}"
+        logger.warning(f"Gemini (LangChain) failed: {e}")
+        return f"(LLM report generation failed: {e})"
+
+
+# ---------------- TEST CASE GENERATION (LangChain Groq) ----------------
+def generate_test_cases_with_logging(code_text: str, max_cases: int = 8) -> dict:
+    """Uses Groq API (via LangChain) for test case generation."""
+    
+    # Using a standard, fast Groq model
+    try:
+        llm = ChatGroq(model_name="llama3-8b-8192")
+        
+        system_prompt = f"""
+You are a test case generator. Given the C code, generate {max_cases} test cases.
+Format your response as a valid JSON object with a single key "tests", 
+which is an array of strings.
+Each string must be in the format 'input::expected_output'.
+Do not provide any other text, just the JSON.
+"""
+        
+        human_prompt = f"C Code:\n{code_text}"
+        
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            ("human", human_prompt)
+        ])
+        
+        # We chain the model to a JSON parser
+        parser = JsonOutputParser()
+        chain = prompt_template | llm | parser
+
+        # Invoke the chain
+        response_json = chain.invoke({})
+        
+        if response_json and "tests" in response_json and response_json["tests"]:
+            logger.info(f"Groq (LangChain) succeeded in generating {len(response_json['tests'])} tests.")
+            return {
+                "status": "ok",
+                "tests": response_json["tests"][:max_cases], # Ensure we don't exceed max_cases
+                "reason": "Groq (LangChain) success",
+            }
+        else:
+            raise Exception("Groq returned invalid or empty JSON.")
+
+    except (Exception, OutputParserException) as e:
+        logger.warning(f"Groq (LangChain) failed: {e}. Using heuristic fallback.")
+        return {
+            "status": "fallback",
+            "tests": _heuristic_test_gen(code_text, max_cases),
+            "reason": f"Groq (LangChain) failed: {e}; heuristic fallback used",
+        }
+
+
+# ---------------- CONNECTION TEST (LangChain) ----------------
+def test_gemini_connection() -> str:
+    """Quick diagnostic for Gemini 2.5 Flash via LangChain."""
+    try:
+        # CRITICAL FIX: Use the correct model name 'gemini-2.5-flash'
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+        response = llm.invoke("Say 'Gemini 2.5 Flash (LangChain) connection successful.'")
+        return f"Gemini (LangChain) Response: {response.content}"
+    except Exception as e:
+        return f"Gemini (LangChain) connection failed: {e}"
+
+# --- Example of how to run the test ---
+if __name__ == "__main__":
+    print("Testing connections...")
+    print(test_gemini_connection())
+    
+    # Test Groq
+    print("\nTesting Groq Test Case Generation...")
+    test_code = "int main() { int a, b; scanf(\"%d %d\", &a, &b); printf(\"%d\", a + b); return 0; }"
+    test_cases_result = generate_test_cases_with_logging(test_code)
+    print(f"Status: {test_cases_result['status']}")
+    print(f"Tests: {test_cases_result['tests']}")
