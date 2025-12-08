@@ -1,141 +1,144 @@
-# ---------------------------------------------------------
-# LangGraph Grader Pipeline – Core Evaluation Orchestrator
-# ---------------------------------------------------------
+# grader_langgraph.py
+# Clean, well-indented grader orchestrator for the C Autograder pipeline.
+# - Computes final score using the configured weights
+# - Calls compilation, testing, static analysis and perf tools
+# - Handles compilation-failure path (partial marks)
+# - Returns the exact keys expected by the rest of the app
 
 from typing import Dict, Any
+
 from config import (
     WEIGHT_COMPILATION,
     WEIGHT_FUNCTIONAL,
     WEIGHT_STATIC,
-    WEIGHT_PERF
+    WEIGHT_PERF,
 )
 
-# AGENT IMPORTS (EXISTING)
+# Import your agents/tools. These imports must match your repo.
+# If any of these modules are named differently in your repo, update the names below.
 from Llm_agents import (
     CompilationFailureReportAgent,
-    FinalReviewAgent
+    FinalReviewAgent,
 )
-
-# TOOL IMPORTS (EXISTING)
 from tools import (
     compile_c_code_tool,
     run_test_cases_tool,
     static_analysis_tool,
-    performance_analysis_tool
+    performance_analysis_tool,
 )
 
-# ---------------------------------------------------------
-# ✅ FINAL SCORE COMPUTATION (UPDATED 30–30–20–20)
-# ---------------------------------------------------------
 
 def compute_final_score(
     compile_score: float,
     functional_score: float,
     static_score: float,
-    performance_score: float
+    performance_score: float,
 ) -> float:
-    return round(
-        WEIGHT_COMPILATION * compile_score +
-        WEIGHT_FUNCTIONAL * functional_score +
-        WEIGHT_STATIC * static_score +
-        WEIGHT_PERF * performance_score,
-        3
+    """
+    Compute final score using configured weights.
+    Scores should be in 0.0 - 1.0 range.
+    """
+    final = (
+        WEIGHT_COMPILATION * compile_score
+        + WEIGHT_FUNCTIONAL * functional_score
+        + WEIGHT_STATIC * static_score
+        + WEIGHT_PERF * performance_score
     )
+    return round(final, 3)
 
-# ---------------------------------------------------------
-# ✅ MAIN AGENTIC PIPELINE (UNCHANGED FLOW)
-# ---------------------------------------------------------
 
 def run_grader_pipeline(user_code: str) -> Dict[str, Any]:
     """
-    Runs the complete agentic grading pipeline and returns all
-    diagnostic data along with the final score and Gemini feedback.
-    """
+    Run the full grading pipeline and return structured results.
 
-    # -------------------------------
-    # 1️⃣ COMPILATION STAGE
-    # -------------------------------
+    Returns a dict with keys used by app.py:
+      - compile_info
+      - test_info
+      - static_info
+      - perf_info
+      - final_score
+      - final_report (summary, detailed_feedback)
+    """
+    # 1) Compilation stage
     compile_info = compile_c_code_tool(user_code)
 
-    # Defaults
-    test_info = {}
-    static_info = {}
-    perf_info = {}
+    # Initialize placeholders
+    test_info: Dict[str, Any] = {}
+    static_info: Dict[str, Any] = {}
+    perf_info: Dict[str, Any] = {}
 
+    # Default component scores
     compile_score = 1.0 if compile_info.get("status") == "success" else 0.0
     functional_score = 0.0
     static_score = 0.0
     performance_score = 0.0
 
-    # -------------------------------
-    # 2️⃣ IF COMPILATION SUCCESS → FULL PIPELINE
-    # -------------------------------
+    # 2) If compilation succeeded, run full pipeline
     if compile_info.get("status") == "success":
-
-        # ✅ Functional Testing
+        # Functional testing
         test_info = run_test_cases_tool(compile_info)
         passed = test_info.get("passed_count", 0)
         total = test_info.get("total_count", 1)
-        functional_score = passed / total if total > 0 else 0.0
+        functional_score = (passed / total) if total > 0 else 0.0
 
-        # ✅ Static Analysis
+        # Static analysis
         static_info = static_analysis_tool(user_code)
         issue_count = len(static_info.get("issues", []))
+        # Each flagged issue deducts 0.2 from static_score, bounded to [0,1]
         static_score = max(0.0, 1.0 - (0.2 * issue_count))
 
-        # ✅ Performance Analysis
+        # Performance analysis
         perf_info = performance_analysis_tool(compile_info)
+        # Here we keep performance_score = 1.0 as a baseline (adjust as needed)
         performance_score = 1.0
 
-        # ✅ Final Scoring (Normal Case)
+        # Compute final numeric score
         final_score = compute_final_score(
             compile_score,
             functional_score,
             static_score,
-            performance_score
+            performance_score,
         )
 
-        final_report = FinalReviewAgent({
-            "compile_info": compile_info,
-            "test_info": test_info,
-            "static_info": static_info,
-            "perf_info": perf_info,
-            "final_score": final_score
-        })
+        # Final LLM review (Gemini) — returns dict with 'summary' and 'detailed_feedback'
+        final_review = FinalReviewAgent(
+            {
+                "compile_info": compile_info,
+                "test_info": test_info,
+                "static_info": static_info,
+                "perf_info": perf_info,
+                "final_score": final_score,
+            }
+        )
 
-    # -------------------------------
-    # 3️⃣ ✅ COMPILATION FAILURE → PARTIAL MARKING ENABLED
-    # -------------------------------
+    # 3) If compilation failed, award partial marks (static + perf) and create failure report
     else:
-
-        # ✅ Static Analysis still runs
+        # Still run static analysis (structural assessment)
         static_info = static_analysis_tool(user_code)
         issue_count = len(static_info.get("issues", []))
         static_score = max(0.0, 1.0 - (0.2 * issue_count))
 
-        # ✅ Performance score granted structurally (as per your rule)
+        # Performance gets a structural default (adjustable)
         performance_score = 0.6
 
-        # ✅ ❗ Functional Score = 0 (no execution)
+        # No functional execution possible
         functional_score = 0.0
+        compile_score = 0.0
 
-        # ✅ ✅ PARTIAL FINAL SCORE (STATIC + PERFORMANCE ONLY)
+        # Final score uses only static and performance weights (per your policy)
         final_score = round(
-            (WEIGHT_STATIC * static_score) +
-            (WEIGHT_PERF * performance_score),
-            3
+            (WEIGHT_STATIC * static_score) + (WEIGHT_PERF * performance_score),
+            3,
         )
 
-        # ✅ Gemini Failure Review with Partial Marks
-        final_report = CompilationFailureReportAgent(
+        # LLM agent that generates a failure-style review and awards partials
+        final_review = CompilationFailureReportAgent(
             compile_info=compile_info,
             static_score=static_score,
-            perf_score=performance_score
+            perf_score=performance_score,
         )
 
-    # -------------------------------
-    # ✅ FINAL STRUCTURED OUTPUT (UNCHANGED CONTRACT)
-    # -------------------------------
+    # Construct the returned structure exactly as expected by app.py
     return {
         "compile_info": compile_info,
         "test_info": test_info,
@@ -143,7 +146,7 @@ def run_grader_pipeline(user_code: str) -> Dict[str, Any]:
         "perf_info": perf_info,
         "final_score": final_score,
         "final_report": {
-            "summary": final_report.get("summary"),
-            "detailed_feedback": final_report.get("detailed_feedback")
-        }
+            "summary": final_review.get("summary"),
+            "detailed_feedback": final_review.get("detailed_feedback"),
+        },
     }
