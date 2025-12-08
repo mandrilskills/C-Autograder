@@ -114,18 +114,21 @@ def measure_perf(state: GraderState) -> GraderState:
 
 def calculate_final_score(state: GraderState) -> GraderState:
     """Calculates the raw final score based on fixed weights."""
-    from config import WEIGHT_FUNCTIONAL, WEIGHT_STATIC, WEIGHT_PERF
+   from config import (
+    WEIGHT_COMPILATION,
+    WEIGHT_FUNCTIONAL,
+    WEIGHT_STATIC,
+    WEIGHT_PERF
+)
 
-    if state['compile_info'].get('status') != "success":
-        state['final_score'] = 0.0
-    else:
-        func_score = state['test_info'].get('functional_score', 0.0)
-        static_score = state['static_info'].get('static_score', 0.0)
-        perf_score = state['perf_info'].get('perf_score', 0.0)
-        state['final_score'] = (func_score * WEIGHT_FUNCTIONAL) + \
-                               (static_score * WEIGHT_STATIC) + \
-                               (perf_score * WEIGHT_PERF)
-    return state
+def compute_final_score(compile_score, func_score, static_score, perf_score):
+    return round(
+        WEIGHT_COMPILATION * compile_score +
+        WEIGHT_FUNCTIONAL * func_score +
+        WEIGHT_STATIC * static_score +
+        WEIGHT_PERF * perf_score,
+        3
+    )
 
 def after_compile_tasks(state: GraderState) -> GraderState:
     """Runs static analysis, performance measurement, and test generation concurrently."""
@@ -242,3 +245,4 @@ def run_grader_pipeline(code_text: str) -> Dict[str, Any]:
         "test_info": final_state.get('test_info'),
         "test_cases_used": final_state.get('test_cases'),
     }
+
