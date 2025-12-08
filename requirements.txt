@@ -1,10 +1,10 @@
-# requirements.txt
-
 streamlit
 reportlab
 pydantic
 langgraph
 langchain
+langchain-core
 langchain-groq
 langchain-google-genai
+requests
 python-dotenv
