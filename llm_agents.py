@@ -39,8 +39,7 @@ class FinalReviewOutput(BaseModel):
 # Groq for fast, structured generation (Test Cases)
 groq_llm = ChatGroq(
     temperature=0.0,
-    # CRITICAL FIX: Updated decommissioned model ID to the supported replacement
-    model_name="llama-3.1-8b-instant" 
+    model_name="llama-3.1-8b-instant" # FIX: Retaining the fix for decommissioned Groq model
 )
 # Gemini Flash for complex reasoning and detailed reporting
 gemini_llm = ChatGoogleGenerativeAI(
@@ -70,7 +69,7 @@ def TestGeneratorAgent(code_text: str) -> TestCasesOutput:
     parser = JsonOutputParser(pydantic_object=TestCasesOutput)
     
     prompt = PromptTemplate(
-        template="""You are an expert Test Case Generator for C code. Analyze the C source code and generate a list of up to 5 diverse test cases (inputs and exact expected outputs) to fully test its functionality. CODE: --- {code_text} --- {format_instructions}""",
+        template="""You are an expert Test Case Generator for C code. Analyze the C source code and generate a list of up to 5 diverse test cases (inputs and exact expected outputs) to fully test its functionality. You MUST set the 'status' field to 'success'. CODE: --- {code_text} --- {format_instructions}""",
         input_variables=["code_text"],
         partial_variables={"format_instructions": parser.get_format_instructions()}
     )
@@ -78,7 +77,8 @@ def TestGeneratorAgent(code_text: str) -> TestCasesOutput:
     
     try:
         result = chain.invoke({"code_text": code_text})
-        return TestCasesOutput(status="success", **result)
+        # FIX: Removed explicit 'status="success"' to resolve 'got multiple values' error
+        return TestCasesOutput(**result)
     except OutputParserException as e:
         logger.warning(f"Groq Test Generator failed: {e}. Using heuristic fallback.")
         fallback_tests = _heuristic_test_gen(code_text, 5)
@@ -97,7 +97,7 @@ def TestRepairAgent(code_text: str, test_info: Dict[str, Any]) -> TestCasesOutpu
     failure_summary = json.dumps(failed_tests, indent=2)
     
     prompt = PromptTemplate(
-        template="""You are the Test Repair Agent. The student's C code failed ALL initial functional tests. Analyze the failures and, if the existing tests were clearly incorrect (e.g., incorrect expected output for a correct input), generate a *revised* list of up to 5 test cases. If the failures are due to a student code bug, return the original tests and explain the bug in your reasoning.
+        template="""You are the Test Repair Agent. The student's C code failed ALL initial functional tests. Analyze the failures and, if the existing tests were clearly incorrect (e.g., incorrect expected output for a correct input), generate a *revised* list of up to 5 test cases. You MUST set the 'status' field to 'repaired'. If the failures are due to a student code bug, return the original tests and explain the bug in your reasoning.
         C CODE: {code_text}
         FAILED TEST SUMMARY: {failure_summary}
         {format_instructions}
@@ -110,14 +110,15 @@ def TestRepairAgent(code_text: str, test_info: Dict[str, Any]) -> TestCasesOutpu
     
     try:
         result = chain.invoke({"code_text": code_text, "failure_summary": failure_summary})
-        return TestCasesOutput(status="repaired", **result)
+        # FIX: Removed explicit 'status="repaired"' to resolve 'got multiple values' error
+        return TestCasesOutput(**result)
     except Exception as e:
         logger.error(f"Gemini Test Repair Agent failed: {e}. Cannot repair tests.")
         return TestCasesOutput(tests=[], reason="Repair agent failed.", status="repair_fail")
 
 
 def CompilationFailureReportAgent(compile_info: Dict[str, Any]) -> FinalReviewOutput:
-    """Agent that generates a specialized report for a critical compilation failure."""
+    # ... (remains the same) ...
     parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
     error_message = compile_info.get("stderr", "No compilation error message provided.")
     
@@ -148,7 +149,7 @@ def CompilationFailureReportAgent(compile_info: Dict[str, Any]) -> FinalReviewOu
 
 
 def FinalReviewerAgent(full_evaluation_data: Dict[str, Any]) -> FinalReviewOutput:
-    """Agent to generate the final report, review scores, and provide holistic feedback."""
+    # ... (remains the same) ...
     parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
 
     initial_score = full_evaluation_data.get('final_score', 0.0)
