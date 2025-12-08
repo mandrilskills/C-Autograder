@@ -1,35 +1,20 @@
-# ---------------------------------------------------------
-# Configuration File for C Autograder Agentic Pipeline
-# ---------------------------------------------------------
+# config.py
+# Centralized configuration for the C autograder.
 
-# -------------------------------
-# LLM MODEL CONFIGURATIONS
-# -------------------------------
-
-MODEL_GROQ = "llama-3.1-8b-instant"
+MODEL_GROQ = "llama-3.1-8b-instant"  # kept for consistency (not used in local-only mode)
 MODEL_GEMINI = "gemini-2.5-flash"
 
-
-# -------------------------------
-# SYSTEM LIMITS
-# -------------------------------
-
+# Limits & behavior
 MAX_TEST_CASES = 5
 TEMP_DIR_PREFIX = "autograder_"
+COMPILE_TIMEOUT = 20        # seconds allowed for gcc
+RUN_TIMEOUT = 2            # seconds per test run
+CPPcheck_TIMEOUT = 10      # seconds for cppcheck
 
-
-# -------------------------------
-# ✅ UPDATED MARKING SCHEME (AS REQUIRED)
-# -------------------------------
-
-# Compilation Weight
-WEIGHT_COMPILATION = 0.30
-
-# Functional Test Weight
-WEIGHT_FUNCTIONAL = 0.30
-
-# Static Code Analysis Weight
-WEIGHT_STATIC = 0.20
-
-# Performance Evaluation Weight
+# Scoring weights (must sum to 1.0)
+WEIGHT_FUNCTIONAL = 0.50
+WEIGHT_STATIC = 0.30
 WEIGHT_PERF = 0.20
+
+# Partial credit rules
+PARTIAL_ON_COMPILE_FAIL = True  # Award partial marks based on heuristics when compilation fails
