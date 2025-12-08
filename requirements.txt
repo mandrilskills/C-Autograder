@@ -1,5 +1,6 @@
-streamlit
-reportlab
+streamlit>=1.20
+reportlab>=3.6
+
 pydantic
 langgraph
 langchain
@@ -8,3 +9,4 @@ langchain-groq
 langchain-google-genai
 requests
 python-dotenv
+
