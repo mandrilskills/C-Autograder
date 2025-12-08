@@ -1,5 +1,5 @@
 # ---------------------------------------------------------
-# LLM AGENTS FOR C AUTOGRADER (GEMINI + GROQ)
+# LLM AGENTS FOR C AUTOGRADER (SAFE GEMINI + GROQ)
 # ---------------------------------------------------------
 
 from typing import Dict, Any
@@ -8,11 +8,13 @@ from langchain.output_parsers import JsonOutputParser
 from pydantic import BaseModel, Field
 
 from config import MODEL_GEMINI, WEIGHT_STATIC, WEIGHT_PERF
+
+# ✅ SAFE LLM IMPORT (NO CRASH IF KEY IS MISSING)
 from llm_loader import gemini_llm, groq_llm
 
 
 # ---------------------------------------------------------
-# ✅ FINAL REVIEW OUTPUT SCHEMA (UNCHANGED)
+# ✅ FINAL REVIEW OUTPUT SCHEMA (UNCHANGED CONTRACT)
 # ---------------------------------------------------------
 
 class FinalReviewOutput(BaseModel):
@@ -23,7 +25,7 @@ class FinalReviewOutput(BaseModel):
 
 
 # ---------------------------------------------------------
-# ✅ FINAL REVIEW AGENT (UNCHANGED BEHAVIOUR)
+# ✅ FINAL REVIEW AGENT (SAFE GEMINI FALLBACK)
 # ---------------------------------------------------------
 
 def FinalReviewAgent(full_eval_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -31,6 +33,19 @@ def FinalReviewAgent(full_eval_data: Dict[str, Any]) -> Dict[str, Any]:
     Final holistic evaluation using Gemini 2.5 Flash after
     successful compilation & functional testing.
     """
+
+    # ✅ FAIL-SAFE: If Gemini is not available
+    if gemini_llm is None:
+        return {
+            "summary": "AI feedback unavailable (Gemini API key not configured).",
+            "detailed_feedback": (
+                "The program was evaluated numerically, but detailed "
+                "AI-based review could not be generated because the "
+                "Gemini API key is missing or invalid."
+            ),
+            "revised_score": round(full_eval_data.get("final_score", 0.0), 3),
+            "passed_functional_check": True
+        }
 
     parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
 
@@ -71,13 +86,7 @@ def FinalReviewAgent(full_eval_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------
-# ✅ ✅ ✅ COMPILATION FAILURE AGENT (REQUIRED CHANGE APPLIED)
-# ---------------------------------------------------------
-# 🔴 OLD BEHAVIOUR:
-# revised_score = 0.0   ❌❌❌
-#
-# ✅ NEW BEHAVIOUR:
-# Partial marks awarded using STATIC + PERFORMANCE
+# ✅ ✅ ✅ COMPILATION FAILURE AGENT (SAFE + PARTIAL MARKS)
 # ---------------------------------------------------------
 
 def CompilationFailureReportAgent(
@@ -87,13 +96,38 @@ def CompilationFailureReportAgent(
 ) -> Dict[str, Any]:
     """
     Generates a failure report when compilation fails,
-    but still awards PARTIAL MARKS based on static structure
-    and performance potential.
+    but still awards PARTIAL MARKS based on:
+    • Static structure
+    • Algorithm intent
+    • Performance potential
     """
 
-    parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
-
     error_message = compile_info.get("stderr", "No compilation error message provided.")
+
+    # ✅ FAIL-SAFE: If Gemini is not available
+    if gemini_llm is None:
+        revised_score = round(
+            (WEIGHT_STATIC * static_score) +
+            (WEIGHT_PERF * perf_score),
+            3
+        )
+
+        return {
+            "summary": "Program failed to compile. Partial marks awarded (AI feedback unavailable).",
+            "detailed_feedback": (
+                "The program could not be compiled due to syntax errors.\n\n"
+                "However, partial marks have been awarded based on:\n"
+                "• Code structure\n"
+                "• Logical intent\n"
+                "• Algorithm design (static inspection)\n\n"
+                f"Compilation Error:\n{error_message}"
+            ),
+            "revised_score": revised_score,
+            "passed_functional_check": False
+        }
+
+    # ✅ Normal Gemini-based failure review
+    parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
 
     prompt = PromptTemplate(
         template=(
