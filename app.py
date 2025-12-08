@@ -1,185 +1,198 @@
-# App.py
 import streamlit as st
+import os
 import json
-import io
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+import logging
+from io import BytesIO
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
+# Local imports
 from grader_langgraph import run_grader_pipeline
-from config import WEIGHT_FUNCTIONAL, WEIGHT_STATIC, WEIGHT_PERF
 
-st.set_page_config(page_title="C Autograder (Dev)", layout="wide")
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-st.title("C Autograder — Development Mode")
-st.write("Paste your C code below and run the local grading pipeline. (Dev-mode: runs gcc/cppcheck if installed.)")
+# ---------------------------------------------------------------------
+# PAGE CONFIGURATION
+# ---------------------------------------------------------------------
+st.set_page_config(
+    page_title="C Autograder | Fully Agentic LangGraph",
+    layout="wide",
+    page_icon="🎓"
+)
 
-code_input = st.text_area("C Source Code", height=300, value="""#include <stdio.h>
+@st.cache_data
+def build_pdf(report_data: dict) -> BytesIO:
+    """Builds a PDF report from the final structured report data."""
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    Story = []
+
+    # Title, Score, Summary
+    Story.append(Paragraph("<h1>C Autograder Final Agentic Report</h1>", styles['h1']))
+    Story.append(Spacer(1, 12))
+
+    final_score = report_data.get('final_score', 'N/A')
+    summary = report_data.get('final_report', {}).get('summary', 'No summary available.')
+
+    Story.append(Paragraph(f"<h2>Final Score: {final_score:.2f} / 1.00</h2>", styles['h2']))
+    Story.append(Paragraph(f"<b>Summary:</b> {summary}", styles['Normal']))
+    Story.append(Spacer(1, 24))
+
+    # Detailed Feedback (From LLM Agent)
+    feedback_text = report_data.get('final_report', {}).get('detailed_feedback', 'Detailed feedback could not be retrieved.')
+    Story.append(Paragraph("<h2>Detailed Agent Feedback (Gemini 2.5 Flash)</h2>", styles['h2']))
+    formatted_feedback = feedback_text.replace('\n', '<br/>')
+    Story.append(Paragraph(formatted_feedback, styles['Normal']))
+    Story.append(Spacer(1, 24))
+
+    # Append Raw Data (for detailed report)
+    Story.append(Paragraph("<h3>--- Raw Evaluation Metrics ---</h3>", styles['h3']))
+    # Compilation Info
+    Story.append(Paragraph(f"<b>Compilation Status:</b> {report_data.get('compile_info', {}).get('status')}", styles['Normal']))
+
+    # Test Info
+    test_info = report_data.get('test_info', {})
+    Story.append(Paragraph(f"<b>Functional Tests:</b> {test_info.get('passed_count', 0)} / {test_info.get('total_count', 0)} Passed", styles['Normal']))
+    Story.append(Paragraph(f"<b>Test Repair Attempted:</b> {test_info.get('repaired_attempted', False)}", styles['Normal']))
+
+    # Scoring
+    Story.append(Paragraph(f"<b>Initial Calculated Score:</b> {report_data.get('final_score', 0.0):.2f}", styles['Normal']))
+    Story.append(Spacer(1, 12))
+
+    doc.build(Story)
+    buffer.seek(0)
+    return buffer
+
+# ---------------------------------------------------------------------
+# STREAMLIT UI LOGIC
+# ---------------------------------------------------------------------
+st.title("🎓 C Autograder: Fully Agentic LangGraph Pipeline")
+st.caption("The agent uses conditional logic for routing:\n"
+           "- If compilation fails, a failure report is generated.\n"
+           "- If 0/N tests pass, a Test Repair Agent is invoked.\n"
+           "- Final review is done by Gemini 2.5 Flash with detailed feedback.")
+
+default_code = """#include <stdio.h>
+
 int main() {
-    int x;
-    if (scanf("%d", &x) == 1) {
-        printf("%d", x);
+
+    int a, b;
+
+    printf("Enter two numbers\\n"); // Note the semicolon is back to allow compilation
+
+    if (scanf("%d %d", &a, &b) != 2) {
+
+        return 1;
+
     }
+
+    printf("%d", a + b);
+
     return 0;
+
 }
-""")
+"""
 
-col1, col2 = st.columns([3,1])
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    uploaded_file = st.file_uploader(
+        "Upload C Source Code (.c file)", type="c",
+        help="Upload a .c file containing your C code."
+    )
+    st.markdown("---")
+    user_code = st.text_area(
+        "OR Paste C Source Code here (`main` function only)", default_code,
+        height=300, key="code_input",
+        help="Paste your C code here. Provide only the main function."
+    )
+
 with col2:
-    if st.button("Run Agentic Autograder"):
-        with st.spinner("Running pipeline..."):
-            results = run_grader_pipeline(code_input)
-        st.session_state["results"] = results
+    st.header("Pipeline Control")
+    st.info("The agent dynamically chooses its next step based on the outcome of the previous step.")
+    run_button = st.button(
+        "🚀 Run Agentic Autograder", type="primary", key="run_button",
+        help="Click to start the agentic autograder pipeline."
+    )
 
-results = st.session_state.get("results", None)
-if results:
-    st.subheader("Summary")
-    final_score = results.get("final_score", 0.0)
-    try:
-        final_score_f = float(final_score)
-    except Exception:
-        final_score_f = 0.0
-    st.metric("Final Agentic Score", f"{final_score_f*100:.1f} / 100")
-
-    # Show scoring rubric and earned marks
-    st.subheader("Scoring Rubric")
-    st.markdown(f"- **Functional (weight: {WEIGHT_FUNCTIONAL:.2f})** — earned: **{results.get('scores_breakdown',{}).get('functional',0.0):.2f}**")
-    st.markdown(f"- **Static (weight: {WEIGHT_STATIC:.2f})** — earned: **{results.get('scores_breakdown',{}).get('static',0.0):.2f}**")
-    st.markdown(f"- **Performance (weight: {WEIGHT_PERF:.2f})** — earned: **{results.get('scores_breakdown',{}).get('perf',0.0):.2f}**")
-    st.markdown(f"- **Final (weighted)** — **{results.get('final_score',0.0):.4f} / 1.0** ({results.get('final_score',0.0)*100:.1f}/100)")
-
-    st.subheader("Detailed Report (bullet points)")
-
-    # Compilation section
-    st.markdown("### Compilation")
-    compile_info = results.get("compile_info", {})
-    comp_lines = []
-    comp_status = compile_info.get("status", "unknown")
-    comp_lines.append(f"Status: **{comp_status}**")
-    if "returncode" in compile_info:
-        comp_lines.append(f"Return code: {compile_info.get('returncode')}")
-    stderr_preview = compile_info.get("stderr", "")
-    if stderr_preview:
-        # show only first few lines
-        preview = "\n".join(stderr_preview.splitlines()[:8])
-        comp_lines.append("Stderr (preview):")
-        comp_lines.extend([f"- {line}" for line in preview.splitlines()])
-
-    for line in comp_lines:
-        st.markdown(f"- {line}")
-
-    # Static analysis
-    st.markdown("### Static Analysis (cppcheck)")
-    static_info = results.get("static_info", {})
-    if static_info:
-        issues = static_info.get("issues", [])
-        if issues:
-            st.markdown(f"- Issues found: {len(issues)}")
-            for i, it in enumerate(issues[:10], start=1):
-                st.markdown(f"  - {it}")
-        else:
-            st.markdown("- No issues reported by cppcheck (or cppcheck not installed).")
+if run_button:
+    code_to_grade = ""
+    if uploaded_file is not None:
+        code_to_grade = uploaded_file.getvalue().decode("utf-8")
+        st.success(f"Grading file: {uploaded_file.name}")
+    elif user_code and user_code != default_code:
+        code_to_grade = user_code
+        st.success("Grading code from text area.")
     else:
-        st.markdown("- No static analysis information available.")
+        st.error("Please provide C code either by uploading a file or pasting it into the text area.")
+        st.stop()
 
-    # Tests
-    st.markdown("### Tests (Functional)")
-    test_info = results.get("test_info", {})
-    total = test_info.get("total_count", 0)
-    passed = test_info.get("passed_count", 0)
-    st.markdown(f"- Tests run: **{total}**, Passed: **{passed}**")
-    for tr in test_info.get("test_results", []):
-        inp = tr.get("input", "")
-        expected = tr.get("expected", "")
-        actual = tr.get("actual", "")
-        passed_flag = tr.get("passed", False)
-        timeout = tr.get("timeout", False)
-        st.markdown(f"- Input: `{inp.strip()}` — Expected: `{expected.strip()}` — Actual: `{str(actual).strip()}` — Passed: **{passed_flag}**{' (timeout)' if timeout else ''}")
-
-    # Performance
-    st.markdown("### Performance")
-    perf_info = results.get("perf_info", {})
-    avg = perf_info.get("average_s", None)
-    if avg is not None:
-        st.markdown(f"- Average runtime (s): **{avg:.4f}**")
-        st.markdown(f"- Individual timings: {', '.join([f'{t:.4f}s' for t in perf_info.get('timings', [])])}")
-    else:
-        st.markdown("- Performance not measured (compilation failed or no runs).")
-
-    # Final reviewer comments
-    st.subheader("Reviewer Comments")
-    final_report = results.get("final_report", {})
-    comments = final_report.get("comments", [])
-    for c in comments:
-        st.markdown(f"- {c}")
-
-    # JSON dump toggle
-    st.subheader("Raw JSON (for debugging)")
-    st.json(results)
-
-    # PDF export
-    def build_pdf(report_data: dict) -> bytes:
-        buf = io.BytesIO()
-        doc = SimpleDocTemplate(buf, pagesize=letter)
-        styles = getSampleStyleSheet()
-        Story = []
-
-        # Title
-        Story.append(Paragraph("C Autograder Report", styles['Title']))
-        Story.append(Spacer(1, 12))
-
-        # Score safely formatted
-        final_score_v = report_data.get('final_score', 0.0)
+    st.session_state.results = None
+    with st.spinner("Running Agentic Pipeline (Groq, Gemini, LangGraph)..."):
         try:
-            final_score_f = float(final_score_v)
-            score_text = f"{final_score_f:.4f}"
-        except Exception:
-            score_text = "N/A"
-        Story.append(Paragraph(f"<b>Final Score (weighted):</b> {score_text} / 1.0", styles['Normal']))
-        Story.append(Spacer(1, 12))
+            results = run_grader_pipeline(code_to_grade)
+            st.session_state.results = results
+        except Exception as e:
+            st.error(f"An unexpected error occurred during the pipeline run: {e}")
+            logger.error(f"Pipeline error: {e}")
 
-        # Sections as bullet lists (Compilation, Static, Tests, Performance)
-        Story.append(Paragraph("<b>Compilation</b>", styles['Heading3']))
-        ci = report_data.get("compile_info", {})
-        Story.append(Paragraph(f"Status: {ci.get('status','unknown')}", styles['Normal']))
-        if ci.get("stderr"):
-            st_preview = "\n".join(ci.get("stderr", "").splitlines()[:10])
-            Story.append(Paragraph("Stderr preview:", styles['Normal']))
-            Story.append(Paragraph(st_preview.replace('\n', '<br/>'), styles['Code'] if 'Code' in styles else styles['Normal']))
-        Story.append(Spacer(1,6))
+if 'results' in st.session_state and st.session_state.results:
+    results = st.session_state.results
+    final_report_data = results.get('final_report', {})
 
-        Story.append(Paragraph("<b>Static Analysis</b>", styles['Heading3']))
-        si = report_data.get("static_info", {})
-        errs = si.get("errors", 0)
-        Story.append(Paragraph(f"Issues found: {errs}", styles['Normal']))
-        Story.append(Spacer(1,6))
+    st.markdown("---")
+    col_score, col_download = st.columns([3, 1])
 
-        Story.append(Paragraph("<b>Tests (Functional)</b>", styles['Heading3']))
-        ti = report_data.get("test_info", {})
-        Story.append(Paragraph(f"Passed {ti.get('passed_count',0)} / {ti.get('total_count',0)} tests", styles['Normal']))
-        Story.append(Spacer(1,6))
+    # Display Final Score
+    final_score = results.get('final_score', 0.0)
+    col_score.metric("Final Agentic Score", f"{final_score * 100:.1f} / 100")
 
-        Story.append(Paragraph("<b>Performance</b>", styles['Heading3']))
-        pi = report_data.get("perf_info", {})
-        if pi.get("average_s") is not None:
-            Story.append(Paragraph(f"Average runtime (s): {pi.get('average_s'):.4f}", styles['Normal']))
-        else:
-            Story.append(Paragraph("Not measured", styles['Normal']))
-        Story.append(Spacer(1,12))
+    # Download PDF Report
+    pdf_buffer = build_pdf(results)
+    col_download.download_button(
+        label="Download A4 PDF Report",
+        data=pdf_buffer,
+        file_name="C_Autograder_Report.pdf",
+        mime="application/pdf",
+        type="secondary",
+        use_container_width=True
+    )
 
-        # Scoring rubric
-        Story.append(Paragraph("<b>Scoring Rubric</b>", styles['Heading3']))
-        Story.append(Paragraph(f"- Functional weight: {WEIGHT_FUNCTIONAL:.2f}", styles['Normal']))
-        Story.append(Paragraph(f"- Static weight: {WEIGHT_STATIC:.2f}", styles['Normal']))
-        Story.append(Paragraph(f"- Performance weight: {WEIGHT_PERF:.2f}", styles['Normal']))
-        Story.append(Spacer(1,6))
+    st.markdown("---")
+    st.header("Agent Feedback Report (Generated by Gemini 2.5 Flash)")
 
-        doc.build(Story)
-        pdf = buf.getvalue()
-        buf.close()
-        return pdf
+    if final_report_data:
+        st.subheader(final_report_data.get('summary', 'No Summary.'))
+        st.markdown(
+            final_report_data.get('detailed_feedback', 'Detailed feedback is missing.'),
+            unsafe_allow_html=True
+        )
+    else:
+        st.warning("The Final Reviewer Agent failed to generate a report.")
 
-    pdf_bytes = build_pdf(results)
-    st.download_button("Download PDF report", data=pdf_bytes, file_name="autograder_report.pdf", mime="application/pdf")
-else:
-    st.info("Run the grader to see results here.")
+    st.markdown("---")
+    st.header("Raw Evaluation Data (Diagnostics)")
+
+    with st.expander("Compilation Info"):
+        st.json(results.get('compile_info'))
+
+    with st.expander("Test Cases Used"):
+        st.json(results.get('test_cases_used'))
+
+    with st.expander("Test Results"):
+        st.json(results.get('test_info'))
+
+    with st.expander("Static Analysis Info"):
+        st.json(results.get('static_info'))
+
+    with st.expander("Performance Info"):
+        st.json(results.get('perf_info'))
+
+    with st.expander("Full State"):
+        # Exclude the large 'final_report' for clarity
+        full_state_copy = {k: v for k, v in results.items() if k != 'final_report'}
+        st.json(full_state_copy)
