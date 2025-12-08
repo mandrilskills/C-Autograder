@@ -39,7 +39,8 @@ class FinalReviewOutput(BaseModel):
 # Groq for fast, structured generation (Test Cases)
 groq_llm = ChatGroq(
     temperature=0.0,
-    model_name="llama3-8b-8192" 
+    # CRITICAL FIX: Updated decommissioned model ID to the supported replacement
+    model_name="llama-3.1-8b-instant" 
 )
 # Gemini Flash for complex reasoning and detailed reporting
 gemini_llm = ChatGoogleGenerativeAI(
@@ -67,7 +68,7 @@ def _heuristic_test_gen(code_text: str, max_cases: int = 5) -> List[TestCase]:
 def TestGeneratorAgent(code_text: str) -> TestCasesOutput:
     """Agent to generate initial test cases for the C code."""
     parser = JsonOutputParser(pydantic_object=TestCasesOutput)
-    # ... (prompt definition for test generation using groq_llm)
+    
     prompt = PromptTemplate(
         template="""You are an expert Test Case Generator for C code. Analyze the C source code and generate a list of up to 5 diverse test cases (inputs and exact expected outputs) to fully test its functionality. CODE: --- {code_text} --- {format_instructions}""",
         input_variables=["code_text"],
