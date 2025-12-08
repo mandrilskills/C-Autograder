@@ -11,8 +11,9 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 # Local imports
 from grader_langgraph import run_grader_pipeline 
-# Re-import test function for diagnostics, though it's internal to llm_agents.py
-from llm_agents import test_gemini_connection
+# The diagnostic function 'test_gemini_connection' has been removed from llm_agents.py 
+# in the agentic restructure, so this import is removed to fix the ImportError.
+# from llm_agents import test_gemini_connection # <--- REMOVED
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -155,4 +156,19 @@ if 'results' in st.session_state and st.session_state.results:
     st.header("Raw Evaluation Data")
     tabs = st.tabs(["Compilation", "Testing/Functional", "Static Analysis", "Performance", "Full State"])
     
-    # ... (Tabs content remains the same, displaying the structured results) ...
+    # Placeholder for displaying raw data in tabs
+    
+    with tabs[0]:
+        st.json(results.get('compile_info'))
+    with tabs[1]:
+        st.json(results.get('test_info'))
+        st.caption("Test Cases Used:")
+        st.json(results.get('test_cases_used'))
+    with tabs[2]:
+        st.json(results.get('static_info'))
+    with tabs[3]:
+        st.json(results.get('perf_info'))
+    with tabs[4]:
+        # Exclude the large 'final_report' data to keep the raw state cleaner
+        full_state_copy = {k: v for k, v in results.items() if k != 'final_report'}
+        st.json(full_state_copy)
