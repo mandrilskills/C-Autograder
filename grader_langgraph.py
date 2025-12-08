@@ -1,244 +1,215 @@
+# grader_langgraph.py
 import os
 import subprocess
+import time
 import json
-import logging
-import tempfile
-import concurrent.futures
-import copy
-from typing import Dict, Any, Literal, List
+import shutil
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 
-from langgraph.graph import StateGraph, END
-
+from config import *
 from llm_agents import (
-    TestGeneratorAgent, TestRepairAgent, FinalReviewerAgent,
-    CompilationFailureReportAgent, TestCasesOutput, FinalReviewOutput
+    generate_tests_agent,
+    repair_tests_agent,
+    compile_failure_agent,
+    final_reviewer_agent
 )
 
-logger = logging.getLogger(__name__)
-
-from dataclasses import dataclass, field
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 @dataclass
 class GraderState:
-    """Represents the state of the C Autograder workflow."""
     code_text: str
-    max_test_cases: int
-    compile_info: Dict[str, Any] = field(default_factory=dict)
-    static_info: Dict[str, Any] = field(default_factory=dict)
-    perf_info: Dict[str, Any] = field(default_factory=dict)
-    test_info: Dict[str, Any] = field(default_factory=dict)  # includes 'repaired_attempted'
-    test_cases: List[Dict[str, str]] = field(default_factory=list)
+    compile_info: dict = None
+    test_results: dict = None
+    static_results: dict = None
+    perf_results: dict = None
     final_score: float = 0.0
-    final_report: FinalReviewOutput = None
+    final_report: dict = None
 
-    def __getitem__(self, key):
-        return getattr(self, key, None)
-    def __setitem__(self, key, value):
-        setattr(self, key, value)
-    def get(self, key, default=None):
-        return getattr(self, key, default)
 
-def compile_code_to_binary(state: GraderState) -> GraderState:
-    """Compiles C code to a binary using gcc."""
+# -------------------- COMPILATION --------------------
+def compile_code(state: GraderState):
+    c_path = os.path.join(TEMP_DIR, "main.c")
+    exe_path = os.path.join(TEMP_DIR, "main.out")
+
+    with open(c_path, "w") as f:
+        f.write(state.code_text)
+
     try:
-        temp_dir = tempfile.mkdtemp(prefix="autograder_")
-        source_path = os.path.join(temp_dir, "submission.c")
-        binary_path = os.path.join(temp_dir, "submission")
-
-        with open(source_path, "w") as f:
-            f.write(state['code_text'])
-
-        result = subprocess.run(
-            ['gcc', source_path, '-o', binary_path, '-Wall', '-Wextra', '-std=c99'],
-            capture_output=True, text=True, timeout=10
+        proc = subprocess.run(
+            ["gcc", c_path, "-o", exe_path],
+            capture_output=True,
+            text=True,
+            timeout=10
         )
-        status = "success" if result.returncode == 0 else "error"
-        state['compile_info'] = {
-            "status": status,
-            "stderr": result.stderr,
-            "binary_path": binary_path if status == "success" else None
+
+        success = proc.returncode == 0
+        compile_score = WEIGHT_COMPILATION if success else WEIGHT_COMPILATION * 0.4
+
+        state.compile_info = {
+            "status": "success" if success else "failed",
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "score": compile_score
         }
-    except subprocess.TimeoutExpired:
-        state['compile_info'] = {"status": "error", "stderr": "Compilation timed out."}
+
+    except Exception as e:
+        state.compile_info = {
+            "status": "error",
+            "stderr": str(e),
+            "score": WEIGHT_COMPILATION * 0.2
+        }
+
     return state
 
-def run_cppcheck(state: GraderState) -> GraderState:
-    """Static analysis with cppcheck."""
-    if state['compile_info'].get('status') != "success":
-        state['static_info'] = {"issues": [], "static_score": 0.0, "reason": "Skipped."}
-        return state
 
-    # Simplified placeholder for actual static analysis
-    num_issues = 2  # example placeholder
-    penalty = min(num_issues * 0.05, 0.3)
-    state['static_info'] = {
-        "issues": [f"Issue {i}" for i in range(num_issues)],
-        "static_score": 1.0 - penalty
+# -------------------- STATIC ANALYSIS --------------------
+def run_static_analysis(state: GraderState):
+    c_path = os.path.join(TEMP_DIR, "main.c")
+
+    try:
+        proc = subprocess.run(
+            ["cppcheck", "--enable=all", "--quiet", c_path],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        issues = proc.stderr.strip().splitlines()
+        issue_count = len(issues)
+
+        if issue_count == 0:
+            static_score = WEIGHT_STATIC
+        elif issue_count <= 3:
+            static_score = WEIGHT_STATIC * 0.7
+        else:
+            static_score = WEIGHT_STATIC * 0.4
+
+        state.static_results = {
+            "issues_found": issue_count,
+            "details": issues,
+            "score": static_score
+        }
+
+    except Exception as e:
+        state.static_results = {
+            "issues_found": 0,
+            "details": [str(e)],
+            "score": WEIGHT_STATIC * 0.3
+        }
+
+    return state
+
+
+# -------------------- TEST EXECUTION --------------------
+def execute_tests(state: GraderState):
+    exe_path = os.path.join(TEMP_DIR, "main.out")
+    tests = generate_tests_agent(state.code_text)
+
+    passed = 0
+    outputs = []
+
+    for test in tests:
+        try:
+            proc = subprocess.run(
+                [exe_path],
+                input=test["input"],
+                text=True,
+                capture_output=True,
+                timeout=5
+            )
+
+            actual = proc.stdout.strip()
+            expected = test["output"].strip()
+
+            if actual == expected:
+                passed += 1
+
+            outputs.append({
+                "input": test["input"],
+                "expected": expected,
+                "actual": actual
+            })
+
+        except Exception as e:
+            outputs.append({"error": str(e)})
+
+    total = len(tests)
+    func_score = (passed / total) * WEIGHT_FUNCTIONAL if total else 0
+
+    state.test_results = {
+        "passed": passed,
+        "total": total,
+        "details": outputs,
+        "score": func_score
     }
+
     return state
 
-def run_tests_on_binary(state: GraderState) -> GraderState:
-    """Executes functional tests on the binary."""
-    binary_path = state['compile_info'].get('binary_path')
-    test_cases = state['test_cases']
-    if not binary_path:
-        state['test_info'] = {"test_results": [], "functional_score": 0.0, "total_count": len(test_cases)}
-        return state
 
-    total_tests = len(test_cases)
-    is_first_run = not state['test_info'].get('repaired_attempted', False)
+# -------------------- PERFORMANCE TESTING --------------------
+def run_performance(state: GraderState):
+    exe_path = os.path.join(TEMP_DIR, "main.out")
 
-    if is_first_run and total_tests > 0:
-        passed_count = 0
-    elif total_tests > 0:
-        passed_count = total_tests
-    else:
-        passed_count = 0
+    try:
+        start = time.time()
+        subprocess.run([exe_path], input="10\n", text=True, timeout=3)
+        end = time.time()
 
-    functional_score = passed_count / total_tests if total_tests > 0 else 0.0
-    state['test_info'] = {
-        "test_results": [{"passed": True}] * passed_count + [{"passed": False}] * (total_tests - passed_count),
-        "functional_score": functional_score,
-        "passed_count": passed_count,
-        "total_count": total_tests,
-        "repaired_attempted": state['test_info'].get('repaired_attempted', False)
-    }
+        runtime = end - start
+
+        if runtime <= 0.2:
+            perf_score = WEIGHT_PERF
+        elif runtime <= 0.5:
+            perf_score = WEIGHT_PERF * 0.7
+        else:
+            perf_score = WEIGHT_PERF * 0.4
+
+        state.perf_results = {
+            "runtime": runtime,
+            "score": perf_score
+        }
+
+    except:
+        state.perf_results = {
+            "runtime": None,
+            "score": WEIGHT_PERF * 0.3
+        }
+
     return state
 
-def measure_perf(state: GraderState) -> GraderState:
-    """Measures performance (runtime) of the binary."""
-    avg_runtime = 0.05  # placeholder for 0.05s
-    perf_score = 1.0
-    state['perf_info'] = {"average_runtime": f"{avg_runtime:.4f}s", "perf_score": perf_score}
-    return state
 
-def calculate_final_score(state: GraderState) -> GraderState:
-    """Calculates the raw final score based on fixed weights."""
-    from config import WEIGHT_FUNCTIONAL, WEIGHT_STATIC, WEIGHT_PERF
+# -------------------- FINAL PIPELINE --------------------
+def run_grader_pipeline(code_text: str):
+    state = GraderState(code_text=code_text)
 
-    if state['compile_info'].get('status') != "success":
-        state['final_score'] = 0.0
-    else:
-        func_score = state['test_info'].get('functional_score', 0.0)
-        static_score = state['static_info'].get('static_score', 0.0)
-        perf_score = state['perf_info'].get('perf_score', 0.0)
-        state['final_score'] = (func_score * WEIGHT_FUNCTIONAL) + \
-                               (static_score * WEIGHT_STATIC) + \
-                               (perf_score * WEIGHT_PERF)
-    return state
+    state = compile_code(state)
 
-def after_compile_tasks(state: GraderState) -> GraderState:
-    """Runs static analysis, performance measurement, and test generation concurrently."""
-    if state['compile_info'].get('status') != "success":
-        return state
+    if state.compile_info["status"] == "failed":
+        state.final_report = compile_failure_agent(state)
+        total = state.compile_info["score"]
+        state.final_score = round(total, 2)
+        return state.__dict__
 
-    # Prepare copies for parallel execution
-    state_static = copy.deepcopy(state)
-    state_perf = copy.deepcopy(state)
-    state_test = copy.deepcopy(state)
+    with ThreadPoolExecutor() as executor:
+        state = executor.submit(run_static_analysis, state).result()
+        state = executor.submit(execute_tests, state).result()
+        state = executor.submit(run_performance, state).result()
 
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        future_static = executor.submit(run_cppcheck, state_static)
-        future_perf = executor.submit(measure_perf, state_perf)
-        future_tests = executor.submit(TestGeneratorAgent, state_test['code_text'])
-
-        static_result = future_static.result()
-        perf_result = future_perf.result()
-        test_output = future_tests.result()
-
-    state['static_info'] = static_result['static_info']
-    state['perf_info'] = perf_result['perf_info']
-    state['test_cases'] = [t.model_dump() for t in test_output.tests]
-    return state
-
-def agent_test_repairer(state: GraderState) -> GraderState:
-    result: TestCasesOutput = TestRepairAgent(state['code_text'], state['test_info'])
-    if result.status == "repaired" and result.tests:
-        state['test_cases'] = [t.model_dump() for t in result.tests]
-    return state
-
-def agent_compilation_failure_reporter(state: GraderState) -> GraderState:
-    result: FinalReviewOutput = CompilationFailureReportAgent(state['compile_info'])
-    state['final_report'] = result
-    state['final_score'] = result.revised_score
-    return state
-
-def agent_final_reviewer(state: GraderState) -> GraderState:
-    full_evaluation_data = {
-        "final_score": state['final_score'],
-        "compile_info": state['compile_info'],
-        "static_info": state['static_info'],
-        "perf_info": state['perf_info'],
-        "test_info": state['test_info']
-    }
-    result: FinalReviewOutput = FinalReviewerAgent(full_evaluation_data)
-    test_results = state['test_info'].get('test_results', [])
-    passed = all(t.get('passed', False) for t in test_results)
-    result_dict = result.model_dump()
-    result_dict['passed_functional_check'] = passed
-    state['final_report'] = FinalReviewOutput(**result_dict)
-    state['final_score'] = state['final_report'].revised_score
-    return state
-
-def route_after_compile(state: GraderState) -> Literal['AFTER_COMPILE', 'FAIL_REPORT']:
-    """Routes to failure report or continues checks."""
-    if state['compile_info'].get('status') != "success":
-        return 'FAIL_REPORT'
-    return 'AFTER_COMPILE'
-
-def route_after_tests(state: GraderState) -> Literal['REPAIR', 'CALC_SCORE']:
-    """Decides whether to attempt test repair or proceed."""
-    total = state['test_info'].get('total_count', 0)
-    passed = state['test_info'].get('passed_count', 0)
-    attempted = state['test_info'].get('repaired_attempted', False)
-
-    if total > 0 and passed == 0 and not attempted:
-        state['test_info']['repaired_attempted'] = True
-        return 'REPAIR'
-    return 'CALC_SCORE'
-
-def run_grader_pipeline(code_text: str) -> Dict[str, Any]:
-    """Initializes and runs the full agentic grading pipeline."""
-    workflow = StateGraph(GraderState)
-
-    # 1. Add Nodes
-    workflow.add_node("COMPILE", compile_code_to_binary)
-    workflow.add_node("AFTER_COMPILE", after_compile_tasks)
-    workflow.add_node("TEST_RUN", run_tests_on_binary)
-    workflow.add_node("TEST_REPAIR", agent_test_repairer)
-    workflow.add_node("CALC_SCORE", calculate_final_score)
-    workflow.add_node("FAIL_REPORT", agent_compilation_failure_reporter)
-    workflow.add_node("FINAL_REVIEWER", agent_final_reviewer)
-
-    # 2. Build Edges
-    workflow.set_entry_point("COMPILE")
-    workflow.add_conditional_edges(
-        "COMPILE", route_after_compile,
-        {'AFTER_COMPILE': "AFTER_COMPILE", 'FAIL_REPORT': "FAIL_REPORT"}
+    total_score = (
+        state.compile_info["score"] +
+        state.static_results["score"] +
+        state.test_results["score"] +
+        state.perf_results["score"]
     )
-    workflow.add_edge("FAIL_REPORT", END)
 
-    workflow.add_edge("AFTER_COMPILE", "TEST_RUN")
-    workflow.add_conditional_edges(
-        "TEST_RUN", route_after_tests,
-        {'REPAIR': "TEST_REPAIR", 'CALC_SCORE': "CALC_SCORE"}
-    )
-    workflow.add_edge("TEST_REPAIR", "TEST_RUN")
+    total_score = min(max(round(total_score, 3), 0), 1)
 
-    workflow.add_edge("CALC_SCORE", "FINAL_REVIEWER")
-    workflow.add_edge("FINAL_REVIEWER", END)
+    state.final_score = total_score
+    state.final_report = final_reviewer_agent(state)
 
-    app = workflow.compile()
-    from config import MAX_TEST_CASES
-    initial_state = GraderState(code_text=code_text, max_test_cases=MAX_TEST_CASES)
-    final_state = app.invoke(initial_state)
+    shutil.rmtree(TEMP_DIR, ignore_errors=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
 
-    return {
-        "final_score": final_state.get('final_score'),
-        "final_report": final_state.get('final_report').model_dump() if final_state.get('final_report') else None,
-        "compile_info": final_state.get('compile_info'),
-        "static_info": final_state.get('static_info'),
-        "perf_info": final_state.get('perf_info'),
-        "test_info": final_state.get('test_info'),
-        "test_cases_used": final_state.get('test_cases'),
-    }
+    return state.__dict__
