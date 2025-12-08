@@ -1,51 +1,53 @@
-# grader_langgraph.py
-
 import os
 import subprocess
 import json
 import logging
-import time
+import tempfile
+import concurrent.futures
+import copy
 from typing import Dict, Any, Literal, List
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel # Used only for type hinting GraderState
 
-# Local imports
+from langgraph.graph import StateGraph, END
+
 from llm_agents import (
-    TestGeneratorAgent, TestRepairAgent, FinalReviewerAgent, 
-    CompilationFailureReportAgent, TestCasesOutput, FinalReviewOutput, TestCase
+    TestGeneratorAgent, TestRepairAgent, FinalReviewerAgent,
+    CompilationFailureReportAgent, TestCasesOutput, FinalReviewOutput
 )
 
 logger = logging.getLogger(__name__)
 
-# --- Graph State Definition (The agent's memory) ---
-class GraderState(Dict):
+from dataclasses import dataclass, field
+
+@dataclass
+class GraderState:
     """Represents the state of the C Autograder workflow."""
     code_text: str
     max_test_cases: int
-    
-    compile_info: Dict[str, Any] = {}
-    static_info: Dict[str, Any] = {}
-    perf_info: Dict[str, Any] = {}
-    test_info: Dict[str, Any] = {} # Now includes 'repaired_attempted' flag
-    
-    test_cases: List[Dict[str, str]] = [] 
+    compile_info: Dict[str, Any] = field(default_factory=dict)
+    static_info: Dict[str, Any] = field(default_factory=dict)
+    perf_info: Dict[str, Any] = field(default_factory=dict)
+    test_info: Dict[str, Any] = field(default_factory=dict)  # includes 'repaired_attempted'
+    test_cases: List[Dict[str, str]] = field(default_factory=list)
     final_score: float = 0.0
     final_report: FinalReviewOutput = None
 
-
-# --- Tool Functions (Execution Nodes - Simplified) ---
+    def __getitem__(self, key):
+        return getattr(self, key, None)
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 def compile_code_to_binary(state: GraderState) -> GraderState:
-    # ... (Implementation of compilation logic using subprocess.run)
-    # NOTE: Implementation should be detailed in the actual file.
-    temp_dir = "/tmp/autograder" 
-    os.makedirs(temp_dir, exist_ok=True)
-    source_path = os.path.join(temp_dir, "submission.c")
-    binary_path = os.path.join(temp_dir, "submission")
-    
-    with open(source_path, "w") as f: f.write(state['code_text'])
-    
+    """Compiles C code to a binary using gcc."""
     try:
+        temp_dir = tempfile.mkdtemp(prefix="autograder_")
+        source_path = os.path.join(temp_dir, "submission.c")
+        binary_path = os.path.join(temp_dir, "submission")
+
+        with open(source_path, "w") as f:
+            f.write(state['code_text'])
+
         result = subprocess.run(
             ['gcc', source_path, '-o', binary_path, '-Wall', '-Wextra', '-std=c99'],
             capture_output=True, text=True, timeout=10
@@ -58,54 +60,42 @@ def compile_code_to_binary(state: GraderState) -> GraderState:
         }
     except subprocess.TimeoutExpired:
         state['compile_info'] = {"status": "error", "stderr": "Compilation timed out."}
-    
     return state
-
 
 def run_cppcheck(state: GraderState) -> GraderState:
-    # ... (Implementation of static analysis logic)
-    if state['compile_info']['status'] != "success":
+    """Static analysis with cppcheck."""
+    if state['compile_info'].get('status') != "success":
         state['static_info'] = {"issues": [], "static_score": 0.0, "reason": "Skipped."}
         return state
-        
-    # --- Simplified Cppcheck run ---
-    # The scoring logic remains: -0.05 per issue, max penalty 0.3
-    # ...
-    num_issues = 2 # Placeholder for actual Cppcheck result parsing
+
+    # Simplified placeholder for actual static analysis
+    num_issues = 2  # example placeholder
     penalty = min(num_issues * 0.05, 0.3)
-    state['static_info'] = {"issues": [f"Issue {i}" for i in range(num_issues)], "static_score": 1.0 - penalty}
+    state['static_info'] = {
+        "issues": [f"Issue {i}" for i in range(num_issues)],
+        "static_score": 1.0 - penalty
+    }
     return state
 
-
 def run_tests_on_binary(state: GraderState) -> GraderState:
-    # ... (Implementation of test execution logic)
-    
+    """Executes functional tests on the binary."""
     binary_path = state['compile_info'].get('binary_path')
     test_cases = state['test_cases']
-    
     if not binary_path:
         state['test_info'] = {"test_results": [], "functional_score": 0.0, "total_count": len(test_cases)}
         return state
 
-    # --- Simplified Test Execution ---
-    # NOTE: Assuming one test case in the first run will fail, leading to repair.
-    # In a real run, it executes the code with inputs.
-    
-    results = []
-    passed_count = 0
     total_tests = len(test_cases)
-
-    # Simplified logic to demonstrate repair: If this is the first run, assume 0 passed
-    # If it's the second run (after repair), assume a better result
     is_first_run = not state['test_info'].get('repaired_attempted', False)
-    
+
     if is_first_run and total_tests > 0:
-        passed_count = 0 # Force 0 passed to trigger the Test Repair Agent
+        passed_count = 0
     elif total_tests > 0:
-        passed_count = total_tests # Assume repair fixed the issue
-    
+        passed_count = total_tests
+    else:
+        passed_count = 0
+
     functional_score = passed_count / total_tests if total_tests > 0 else 0.0
-    
     state['test_info'] = {
         "test_results": [{"passed": True}] * passed_count + [{"passed": False}] * (total_tests - passed_count),
         "functional_score": functional_score,
@@ -115,38 +105,50 @@ def run_tests_on_binary(state: GraderState) -> GraderState:
     }
     return state
 
-
 def measure_perf(state: GraderState) -> GraderState:
-    # ... (Implementation of performance measurement logic)
-    
-    # Assume success for the purpose of the structure
-    avg_runtime = 0.05 # Placeholder: 0.05s
+    """Measures performance (runtime) of the binary."""
+    avg_runtime = 0.05  # placeholder for 0.05s
     perf_score = 1.0
     state['perf_info'] = {"average_runtime": f"{avg_runtime:.4f}s", "perf_score": perf_score}
     return state
 
-
 def calculate_final_score(state: GraderState) -> GraderState:
     """Calculates the raw final score based on fixed weights."""
-    W_FUNC, W_STATIC, W_PERF = 0.50, 0.30, 0.20
-    
-    if state['compile_info']['status'] != "success":
-        final_score = 0.0
+    from config import WEIGHT_FUNCTIONAL, WEIGHT_STATIC, WEIGHT_PERF
+
+    if state['compile_info'].get('status') != "success":
+        state['final_score'] = 0.0
     else:
         func_score = state['test_info'].get('functional_score', 0.0)
         static_score = state['static_info'].get('static_score', 0.0)
         perf_score = state['perf_info'].get('perf_score', 0.0)
-        final_score = (func_score * W_FUNC) + (static_score * W_STATIC) + (perf_score * W_PERF)
-        
-    state['final_score'] = final_score
+        state['final_score'] = (func_score * WEIGHT_FUNCTIONAL) + \
+                               (static_score * WEIGHT_STATIC) + \
+                               (perf_score * WEIGHT_PERF)
     return state
 
+def after_compile_tasks(state: GraderState) -> GraderState:
+    """Runs static analysis, performance measurement, and test generation concurrently."""
+    if state['compile_info'].get('status') != "success":
+        return state
 
-# --- LLM Agent Node Wrappers ---
+    # Prepare copies for parallel execution
+    state_static = copy.deepcopy(state)
+    state_perf = copy.deepcopy(state)
+    state_test = copy.deepcopy(state)
 
-def agent_test_generator(state: GraderState) -> GraderState:
-    result: TestCasesOutput = TestGeneratorAgent(state['code_text'])
-    state['test_cases'] = [t.model_dump() for t in result.tests]
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        future_static = executor.submit(run_cppcheck, state_static)
+        future_perf = executor.submit(measure_perf, state_perf)
+        future_tests = executor.submit(TestGeneratorAgent, state_test['code_text'])
+
+        static_result = future_static.result()
+        perf_result = future_perf.result()
+        test_output = future_tests.result()
+
+    state['static_info'] = static_result['static_info']
+    state['perf_info'] = perf_result['perf_info']
+    state['test_cases'] = [t.model_dump() for t in test_output.tests]
     return state
 
 def agent_test_repairer(state: GraderState) -> GraderState:
@@ -167,48 +169,41 @@ def agent_final_reviewer(state: GraderState) -> GraderState:
         "compile_info": state['compile_info'],
         "static_info": state['static_info'],
         "perf_info": state['perf_info'],
-        "test_info": state['test_info'],
+        "test_info": state['test_info']
     }
     result: FinalReviewOutput = FinalReviewerAgent(full_evaluation_data)
-    state['final_report'] = result
-    state['final_score'] = result.revised_score # Final score updated by LLM Reviewer
+    test_results = state['test_info'].get('test_results', [])
+    passed = all(t.get('passed', False) for t in test_results)
+    result_dict = result.model_dump()
+    result_dict['passed_functional_check'] = passed
+    state['final_report'] = FinalReviewOutput(**result_dict)
+    state['final_score'] = state['final_report'].revised_score
     return state
 
-
-# --- Conditional Routing Functions (The Agent's Decision Logic) ---
-
-def route_after_compile(state: GraderState) -> Literal['FAIL_REPORT', 'STATIC_CHECK']:
-    """Decider Agent: Routes to failure report or continues checks."""
-    if state['compile_info']['status'] != "success":
+def route_after_compile(state: GraderState) -> Literal['AFTER_COMPILE', 'FAIL_REPORT']:
+    """Routes to failure report or continues checks."""
+    if state['compile_info'].get('status') != "success":
         return 'FAIL_REPORT'
-    return 'STATIC_CHECK'
+    return 'AFTER_COMPILE'
 
-def route_after_tests(state: GraderState) -> Literal['REPAIR', 'PERFORMANCE']:
-    """Test Failure Router: Decides whether to attempt test repair."""
+def route_after_tests(state: GraderState) -> Literal['REPAIR', 'CALC_SCORE']:
+    """Decides whether to attempt test repair or proceed."""
     total = state['test_info'].get('total_count', 0)
     passed = state['test_info'].get('passed_count', 0)
     attempted = state['test_info'].get('repaired_attempted', False)
-    
-    # Attempt repair only if 0/N tests passed AND no repair has been attempted yet
+
     if total > 0 and passed == 0 and not attempted:
         state['test_info']['repaired_attempted'] = True
         return 'REPAIR'
-        
-    # Otherwise, proceed to performance check (or final report if subsequent step is missing)
-    return 'PERFORMANCE'
-
-# --- Build the LangGraph ---
+    return 'CALC_SCORE'
 
 def run_grader_pipeline(code_text: str) -> Dict[str, Any]:
     """Initializes and runs the full agentic grading pipeline."""
-    
     workflow = StateGraph(GraderState)
-    
+
     # 1. Add Nodes
-    workflow.add_node("TEST_GEN", agent_test_generator)
     workflow.add_node("COMPILE", compile_code_to_binary)
-    workflow.add_node("STATIC_CHECK", run_cppcheck)
-    workflow.add_node("PERFORMANCE", measure_perf)
+    workflow.add_node("AFTER_COMPILE", after_compile_tasks)
     workflow.add_node("TEST_RUN", run_tests_on_binary)
     workflow.add_node("TEST_REPAIR", agent_test_repairer)
     workflow.add_node("CALC_SCORE", calculate_final_score)
@@ -216,46 +211,28 @@ def run_grader_pipeline(code_text: str) -> Dict[str, Any]:
     workflow.add_node("FINAL_REVIEWER", agent_final_reviewer)
 
     # 2. Build Edges
-
-    # Start: Generate tests -> Compile
-    workflow.set_entry_point("TEST_GEN")
-    workflow.add_edge("TEST_GEN", "COMPILE")
-    
-    # Compile -> Decider Agent
+    workflow.set_entry_point("COMPILE")
     workflow.add_conditional_edges(
-        "COMPILE",
-        route_after_compile,
-        {'STATIC_CHECK': "STATIC_CHECK", 'FAIL_REPORT': "FAIL_REPORT"}
+        "COMPILE", route_after_compile,
+        {'AFTER_COMPILE': "AFTER_COMPILE", 'FAIL_REPORT': "FAIL_REPORT"}
     )
-    workflow.add_edge("FAIL_REPORT", END) # End of flow for compilation failure
+    workflow.add_edge("FAIL_REPORT", END)
 
-    # Static Check -> Test Run (Sequential)
-    workflow.add_edge("STATIC_CHECK", "TEST_RUN")
-
-    # Test Run -> Test Failure Router
+    workflow.add_edge("AFTER_COMPILE", "TEST_RUN")
     workflow.add_conditional_edges(
-        "TEST_RUN",
-        route_after_tests,
-        {'REPAIR': "TEST_REPAIR", 'PERFORMANCE': "PERFORMANCE"}
+        "TEST_RUN", route_after_tests,
+        {'REPAIR': "TEST_REPAIR", 'CALC_SCORE': "CALC_SCORE"}
     )
-    
-    # Test Repair -> Loop back to re-run tests on the new cases
-    workflow.add_edge("TEST_REPAIR", "TEST_RUN") 
+    workflow.add_edge("TEST_REPAIR", "TEST_RUN")
 
-    # Normal Path
-    workflow.add_edge("PERFORMANCE", "CALC_SCORE")
     workflow.add_edge("CALC_SCORE", "FINAL_REVIEWER")
-
-    # End
     workflow.add_edge("FINAL_REVIEWER", END)
-    
-    app = workflow.compile()
 
-    initial_state = GraderState(code_text=code_text, max_test_cases=5)
-    
+    app = workflow.compile()
+    from config import MAX_TEST_CASES
+    initial_state = GraderState(code_text=code_text, max_test_cases=MAX_TEST_CASES)
     final_state = app.invoke(initial_state)
 
-    # Return the final state data for the app to display
     return {
         "final_score": final_state.get('final_score'),
         "final_report": final_state.get('final_report').model_dump() if final_state.get('final_report') else None,
