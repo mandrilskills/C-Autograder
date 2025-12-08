@@ -1,169 +1,86 @@
-# ---------------------------------------------------------
-# LLM AGENTS FOR C AUTOGRADER (SAFE GEMINI + GROQ)
-# ---------------------------------------------------------
+# llm_agents.py
+"""
+Simplified local 'agents' used by the pipeline.
+These are intentionally lightweight and deterministic fallbacks so the app can run offline.
+"""
 
-from typing import Dict, Any
-from langchain.prompts import PromptTemplate
-from langchain.output_parsers import JsonOutputParser
-from pydantic import BaseModel, Field
+import re
+from typing import List, Dict, Any
 
-from config import MODEL_GEMINI, WEIGHT_STATIC, WEIGHT_PERF
-
-# ✅ SAFE LLM IMPORT (NO CRASH IF KEY IS MISSING)
-from llm_loader import gemini_llm, groq_llm
-
-
-# ---------------------------------------------------------
-# ✅ FINAL REVIEW OUTPUT SCHEMA (UNCHANGED CONTRACT)
-# ---------------------------------------------------------
-
-class FinalReviewOutput(BaseModel):
-    summary: str = Field(description="Short evaluation summary")
-    detailed_feedback: str = Field(description="Detailed multi-point feedback")
-    revised_score: float = Field(description="Revised final score after LLM review")
-    passed_functional_check: bool = Field(description="Whether key logic passed")
-
-
-# ---------------------------------------------------------
-# ✅ FINAL REVIEW AGENT (SAFE GEMINI FALLBACK)
-# ---------------------------------------------------------
-
-def FinalReviewAgent(full_eval_data: Dict[str, Any]) -> Dict[str, Any]:
+def generate_tests_from_code(code_text: str, max_cases: int = 3) -> List[Dict[str, str]]:
     """
-    Final holistic evaluation using Gemini 2.5 Flash after
-    successful compilation & functional testing.
+    Heuristic test generator: tries to detect simple input patterns and create
+    a few minimal tests. This is a fallback generator (no LLM).
     """
+    tests = []
+    # If code contains scanf or reading integers, produce integer tests
+    if re.search(r'\bscanf\s*\(|\bscanf_s\s*\(', code_text):
+        tests = [
+            {"input": "1\n", "expected": "1"},
+            {"input": "2\n", "expected": "2"},
+            {"input": "10\n", "expected": "10"},
+        ]
+    else:
+        # fallback: no-input run
+        tests = [{"input": "", "expected": ""}]
+    return tests[:max_cases]
 
-    # ✅ FAIL-SAFE: If Gemini is not available
-    if gemini_llm is None:
-        return {
-            "summary": "AI feedback unavailable (Gemini API key not configured).",
-            "detailed_feedback": (
-                "The program was evaluated numerically, but detailed "
-                "AI-based review could not be generated because the "
-                "Gemini API key is missing or invalid."
-            ),
-            "revised_score": round(full_eval_data.get("final_score", 0.0), 3),
-            "passed_functional_check": True
-        }
 
-    parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
-
-    prompt = PromptTemplate(
-        template=(
-            "You are a strict university-level examiner evaluating a C program.\n\n"
-            "Compilation Info:\n{compile_info}\n\n"
-            "Functional Test Results:\n{test_info}\n\n"
-            "Static Analysis:\n{static_info}\n\n"
-            "Performance Metrics:\n{perf_info}\n\n"
-            "Final Numeric Score (pre-LLM): {final_score}\n\n"
-            "Now generate:\n"
-            "1. A short exam-style summary\n"
-            "2. Detailed bullet-point feedback\n"
-            "3. Decide if core logic passed\n\n"
-            "{format_instructions}"
-        ),
-        input_variables=["compile_info", "test_info", "static_info", "perf_info", "final_score"],
-        partial_variables={"format_instructions": parser.get_format_instructions()}
-    )
-
-    chain = prompt | gemini_llm | parser
-
-    result = chain.invoke({
-        "compile_info": full_eval_data.get("compile_info"),
-        "test_info": full_eval_data.get("test_info"),
-        "static_info": full_eval_data.get("static_info"),
-        "perf_info": full_eval_data.get("perf_info"),
-        "final_score": round(full_eval_data.get("final_score", 0.0), 3)
-    })
-
+def compilation_failure_report(compile_info: Dict[str, Any], code_text: str) -> Dict[str, Any]:
+    """
+    Produce a helpful structured report when compilation fails.
+    """
+    stderr = compile_info.get("stderr", "")
+    short_err = stderr.splitlines()[:8]
+    # Basic heuristics for partial grading
+    has_main = bool(re.search(r'\bint\s+main\s*\(|\bint\s+main\s*\(', code_text))
+    includes = re.findall(r'#include\s*<([^>]+)>', code_text)
+    style_issues = []
+    if not has_main:
+        style_issues.append("Missing main() function.")
+    if "stdio.h" not in includes:
+        style_issues.append("stdio.h not included (maybe no IO present).")
     return {
-        "summary": result.summary,
-        "detailed_feedback": result.detailed_feedback,
-        "revised_score": result.revised_score,
-        "passed_functional_check": result.passed_functional_check
+        "summary": "Compilation failed. See stderr for details.",
+        "stderr_preview": "\n".join(short_err),
+        "heuristics": {
+            "has_main": has_main,
+            "includes": includes,
+            "style_issues": style_issues
+        }
     }
 
 
-# ---------------------------------------------------------
-# ✅ ✅ ✅ COMPILATION FAILURE AGENT (SAFE + PARTIAL MARKS)
-# ---------------------------------------------------------
-
-def CompilationFailureReportAgent(
-    compile_info: Dict[str, Any],
-    static_score: float = 0.6,
-    perf_score: float = 0.6
-) -> Dict[str, Any]:
+def final_reviewer(full_eval: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Generates a failure report when compilation fails,
-    but still awards PARTIAL MARKS based on:
-    • Static structure
-    • Algorithm intent
-    • Performance potential
+    Lightweight final reviewer that formats the evaluation and returns a human-readable
+    structured report (no external LLM).
     """
+    final_score = full_eval.get("final_score", 0.0)
+    compile_info = full_eval.get("compile_info", {})
+    test_info = full_eval.get("test_info", {})
+    static_info = full_eval.get("static_info", {})
+    perf_info = full_eval.get("perf_info", {})
 
-    error_message = compile_info.get("stderr", "No compilation error message provided.")
+    comments = []
+    if compile_info.get("status") != "success":
+        comments.append("Compilation failed; awarded partial marks based on code structure and heuristics.")
+    else:
+        comments.append("Compiled successfully. Functional tests and static analysis evaluated.")
 
-    # ✅ FAIL-SAFE: If Gemini is not available
-    if gemini_llm is None:
-        revised_score = round(
-            (WEIGHT_STATIC * static_score) +
-            (WEIGHT_PERF * perf_score),
-            3
-        )
-
-        return {
-            "summary": "Program failed to compile. Partial marks awarded (AI feedback unavailable).",
-            "detailed_feedback": (
-                "The program could not be compiled due to syntax errors.\n\n"
-                "However, partial marks have been awarded based on:\n"
-                "• Code structure\n"
-                "• Logical intent\n"
-                "• Algorithm design (static inspection)\n\n"
-                f"Compilation Error:\n{error_message}"
-            ),
-            "revised_score": revised_score,
-            "passed_functional_check": False
-        }
-
-    # ✅ Normal Gemini-based failure review
-    parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
-
-    prompt = PromptTemplate(
-        template=(
-            "The student's C program FAILED TO COMPILE.\n\n"
-            "However, you must:\n"
-            "• Analyze the compilation error\n"
-            "• Assess logical structure from visible code\n"
-            "• Judge algorithm intent\n"
-            "• Apply university-style STEP MARKING\n\n"
-            "Award PARTIAL MARKS for:\n"
-            "• Static structure\n"
-            "• Algorithm design intent\n\n"
-            "DO NOT give full zero unless logic is completely meaningless.\n\n"
-            "COMPILATION ERROR MESSAGE:\n{error_message}\n\n"
-            "{format_instructions}"
-        ),
-        input_variables=["error_message"],
-        partial_variables={"format_instructions": parser.get_format_instructions()}
-    )
-
-    chain = prompt | gemini_llm | parser
-
-    result = chain.invoke({
-        "error_message": error_message
-    })
-
-    # ✅ ✅ ✅ PARTIAL MARKS COMPUTATION (STATIC + PERFORMANCE ONLY)
-    revised_score = round(
-        (WEIGHT_STATIC * static_score) +
-        (WEIGHT_PERF * perf_score),
-        3
-    )
+    # Add concise pointer comments
+    if static_info.get("errors", 0) > 0:
+        comments.append(f"Static analysis reported {static_info.get('errors')} issue(s).")
+    if test_info.get("passed_count", 0) < test_info.get("total_count", 0):
+        comments.append(f"Passed {test_info.get('passed_count')} / {test_info.get('total_count')} test(s).")
 
     return {
-        "summary": result.summary,
-        "detailed_feedback": result.detailed_feedback,
-        "revised_score": revised_score,
-        "passed_functional_check": False
+        "final_score": final_score,
+        "comments": comments,
+        "detailed": {
+            "compile_info": compile_info,
+            "test_info": test_info,
+            "static_info": static_info,
+            "perf_info": perf_info
+        }
     }
