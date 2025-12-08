@@ -1,9 +1,10 @@
-streamlit==1.38.0
-reportlab==4.2.2
-google-generativeai==0.8.3
+# requirements.txt
+
+streamlit
+reportlab
+pydantic
 langgraph
-python-dotenv==1.0.1
-langchain_google_genai
-langchain_groq
-
-
+langchain
+langchain-groq
+langchain-google-genai
+python-dotenv
