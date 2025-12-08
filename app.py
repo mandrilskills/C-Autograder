@@ -11,7 +11,7 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
 # Local imports
 from grader_langgraph import run_grader_pipeline 
-# CRITICAL FIX: Removed the import of the non-existent function 'test_gemini_connection'
+# The line that caused the previous ImportError is confirmed to be removed.
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
