@@ -107,36 +107,39 @@ def TestRepairAgent(code_text: str, test_info: Dict[str, Any]) -> TestCasesOutpu
         logger.error(f"Gemini Test Repair Agent failed: {e}. Cannot repair tests.")
         return TestCasesOutput(tests=[], reason="Repair agent failed.", status="repair_fail")
 
-def CompilationFailureReportAgent(compile_info: Dict[str, Any]) -> FinalReviewOutput:
-    """Generates feedback report when compilation fails."""
+def CompilationFailureReportAgent(full_eval_data: Dict[str, Any]) -> FinalReviewOutput:
     parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
-    error_message = compile_info.get("stderr", "No compilation error message provided.")
+
+    compile_info = full_eval_data.get("compile_info", {})
+    static_score = full_eval_data.get("static_score", 0.0)
+    perf_score = full_eval_data.get("perf_score", 0.0)
+
+    error_message = compile_info.get("stderr", "No compilation error provided.")
+
     prompt = PromptTemplate(
         template=(
-            "You are a C Programming Tutor. The student's code failed to compile. "
-            "Generate a detailed feedback report focusing ONLY on the compilation errors. "
-            "The revised_score must be 0.0, and detailed_feedback must analyze the error messages and provide a concrete fix. "
-            "COMPILATION ERROR MESSAGE: {error_message}\n"
+            "The student's code failed compilation. However, you must still assess:\n"
+            "• Logical structure\n"
+            "• Algorithm design\n"
+            "• Code organization\n"
+            "Award PARTIAL MARKS based on this.\n\n"
+            "Compilation Error:\n{error_message}\n\n"
             "{format_instructions}"
         ),
         input_variables=["error_message"],
         partial_variables={"format_instructions": parser.get_format_instructions()}
     )
+
     chain = prompt | gemini_llm | parser
+    result = chain.invoke({"error_message": error_message})
 
-    try:
-        result = chain.invoke({"error_message": error_message})
-        result['revised_score'] = 0.0
-        result['passed_functional_check'] = False
-        return FinalReviewOutput(**result)
-    except Exception as e:
-        return FinalReviewOutput(
-            revised_score=0.0,
-            summary="Agent Failure: Could not generate report for compilation error.",
-            detailed_feedback=f"Could not generate LLM report due to an internal error: {e}.",
-            passed_functional_check=False
-        )
+    revised_score = round(0.20 * static_score + 0.20 * perf_score, 3)
 
+    result["revised_score"] = revised_score
+    result["passed_functional_check"] = False
+
+    return FinalReviewOutput(**result)
+    
 def FinalReviewerAgent(full_evaluation_data: Dict[str, Any]) -> FinalReviewOutput:
     """Final reviewer to polish the report and adjust the score if needed."""
     parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
