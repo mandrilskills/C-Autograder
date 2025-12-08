@@ -1,147 +1,179 @@
-# llm_agents_langchain.py
+# llm_agents.py
+
 import os
+import json
 import logging
-from langchain_google_genai import ChatGoogleGenerativeAI
+from typing import List, Dict, Any, Literal
+from pydantic import BaseModel, Field
+
+# LangChain Imports
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import PromptTemplate
 from langchain_core.exceptions import OutputParserException
 from langchain_core.output_parsers import JsonOutputParser
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
-# ---------------- API KEY CHECK (Optional but Recommended) ----------------
-# LangChain loads these automatically, but checking helps debugging.
-if not os.getenv("GOOGLE_API_KEY"):
-    logger.warning("GOOGLE_API_KEY environment variable not set.")
-if not os.getenv("GROQ_API_KEY"):
-    logger.warning("GROQ_API_KEY environment variable not set.")
+# --- Pydantic Schemas for Structured Output ---
 
+class TestCase(BaseModel):
+    """Schema for a single generated test case."""
+    input: str = Field(description="The input string to be piped to the C program's stdin.")
+    expected_output: str = Field(description="The exact expected output (stdout) for the given input.")
 
-# ---------------- HEURISTIC FALLBACK (Unchanged) ----------------
-def _heuristic_test_gen(code_text: str, max_cases: int = 5):
-    code = code_text.lower()
-    if "largest" in code:
-        return [
-            "2 3 1::3.00 is the largest number.",
-            "5 8 7::8.00 is the largest number.",
-            "10 2 3::10.00 is the largest number.",
-            "-5 -2 -10::-2.00 is the largest number.",
-        ]
-    elif "sum" in code:
-        return ["1 2::3", "10 5::15", "-1 1::0"]
-    elif "factorial" in code:
-        return ["3::6", "5::120", "0::1"]
-    else:
-        return ["1::1", "2::2"]
+class TestCasesOutput(BaseModel):
+    """Schema for the list of test cases from a generation agent."""
+    tests: List[TestCase] = Field(description="A list of generated or repaired test cases.")
+    reason: str = Field(description="Brief explanation of the logic used to generate or repair the tests.")
+    status: Literal['success', 'fallback', 'repaired', 'repair_fail'] = Field(description="Status of the generation/repair process.")
 
+class FinalReviewOutput(BaseModel):
+    """Schema for the final report from the Reviewer Agent."""
+    revised_score: float = Field(description="The final calculated score (0.0 to 1.0), possibly adjusted by the LLM.")
+    summary: str = Field(description="A concise summary of the student's performance.")
+    detailed_feedback: str = Field(description="Detailed, actionable feedback covering compilation, testing, quality, and performance.")
+    passed_functional_check: bool = Field(description="True if the code passed all functional tests.")
 
-# ---------------- GEMINI REPORT GENERATION (LangChain) ----------------
-def generate_llm_report(evaluation: dict) -> str:
-    """Generate detailed evaluation report using Gemini 2.5 Flash via LangChain."""
+# --- LLM Initializations ---
+# Groq for fast, structured generation (Test Cases)
+groq_llm = ChatGroq(
+    temperature=0.0,
+    model_name="llama3-8b-8192" 
+)
+# Gemini Flash for complex reasoning and detailed reporting
+gemini_llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0.1
+)
+
+# --- Heuristic Fallback (Used when LLM fails) ---
+def _heuristic_test_gen(code_text: str, max_cases: int = 5) -> List[TestCase]:
+    # Simplified fallback logic
+    tests = []
+    if "scanf" in code_text and max_cases > 0:
+        tests.append(TestCase(input="5 3", expected_output="8"))
+        if max_cases > 1:
+            tests.append(TestCase(input="10 0", expected_output="10"))
+    elif max_cases > 0:
+        tests.append(TestCase(input="", expected_output="Hello"))
     
-    # CRITICAL FIX: Use the correct model name 'gemini-2.5-flash'
+    return tests[:max_cases]
+
+# ---------------------------------------------------------------------
+# AGENT FUNCTIONS (Nodes in the Graph)
+# ---------------------------------------------------------------------
+
+def TestGeneratorAgent(code_text: str) -> TestCasesOutput:
+    """Agent to generate initial test cases for the C code."""
+    parser = JsonOutputParser(pydantic_object=TestCasesOutput)
+    # ... (prompt definition for test generation using groq_llm)
+    prompt = PromptTemplate(
+        template="""You are an expert Test Case Generator for C code. Analyze the C source code and generate a list of up to 5 diverse test cases (inputs and exact expected outputs) to fully test its functionality. CODE: --- {code_text} --- {format_instructions}""",
+        input_variables=["code_text"],
+        partial_variables={"format_instructions": parser.get_format_instructions()}
+    )
+    chain = prompt | groq_llm | parser
+    
     try:
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash",
-            max_output_tokens=900,
-            # Good practice for Gemini to handle system prompts
-            convert_system_message_to_human=True 
+        result = chain.invoke({"code_text": code_text})
+        return TestCasesOutput(status="success", **result)
+    except OutputParserException as e:
+        logger.warning(f"Groq Test Generator failed: {e}. Using heuristic fallback.")
+        fallback_tests = _heuristic_test_gen(code_text, 5)
+        return TestCasesOutput(
+            tests=fallback_tests,
+            reason=f"Groq failed ({e}); heuristic fallback used",
+            status="fallback"
         )
-        
-        prompt_template = ChatPromptTemplate.from_messages([
-            ("system", """
-You are an expert C programming evaluator.
-Analyze the following evaluation JSON and write a structured report with:
-1. Summary
-2. Compilation Details
-3. Static Analysis
-4. Functional Testing
-5. Performance Evaluation
-6. Recommendations
-"""),
-            ("human", "Evaluation JSON:\n{eval_json_str}")
-        ])
-        
-        chain = prompt_template | llm
-        
-        report = chain.invoke({"eval_json_str": str(evaluation)})
-        
-        return report.content or "(LLM report generation failed: Gemini returned empty content.)"
-
-    except Exception as e:
-        logger.warning(f"Gemini (LangChain) failed: {e}")
-        return f"(LLM report generation failed: {e})"
 
 
-# ---------------- TEST CASE GENERATION (LangChain Groq) ----------------
-def generate_test_cases_with_logging(code_text: str, max_cases: int = 8) -> dict:
-    """Uses Groq API (via LangChain) for test case generation."""
+def TestRepairAgent(code_text: str, test_info: Dict[str, Any]) -> TestCasesOutput:
+    """Agent to analyze test failures (when 0/N passed) and generate revised test cases."""
+    parser = JsonOutputParser(pydantic_object=TestCasesOutput)
     
-    # Using a standard, fast Groq model
-    try:
-        llm = ChatGroq(model_name="llama3-8b-8192")
-        
-        system_prompt = f"""
-You are a test case generator. Given the C code, generate {max_cases} test cases.
-Format your response as a valid JSON object with a single key "tests", 
-which is an array of strings.
-Each string must be in the format 'input::expected_output'.
-Do not provide any other text, just the JSON.
-"""
-        
-        human_prompt = f"C Code:\n{code_text}"
-        
-        prompt_template = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            ("human", human_prompt)
-        ])
-        
-        # We chain the model to a JSON parser
-        parser = JsonOutputParser()
-        chain = prompt_template | llm | parser
-
-        # Invoke the chain
-        response_json = chain.invoke({})
-        
-        if response_json and "tests" in response_json and response_json["tests"]:
-            logger.info(f"Groq (LangChain) succeeded in generating {len(response_json['tests'])} tests.")
-            return {
-                "status": "ok",
-                "tests": response_json["tests"][:max_cases], # Ensure we don't exceed max_cases
-                "reason": "Groq (LangChain) success",
-            }
-        else:
-            raise Exception("Groq returned invalid or empty JSON.")
-
-    except (Exception, OutputParserException) as e:
-        logger.warning(f"Groq (LangChain) failed: {e}. Using heuristic fallback.")
-        return {
-            "status": "fallback",
-            "tests": _heuristic_test_gen(code_text, max_cases),
-            "reason": f"Groq (LangChain) failed: {e}; heuristic fallback used",
-        }
-
-
-# ---------------- CONNECTION TEST (LangChain) ----------------
-def test_gemini_connection() -> str:
-    """Quick diagnostic for Gemini 2.5 Flash via LangChain."""
-    try:
-        # CRITICAL FIX: Use the correct model name 'gemini-2.5-flash'
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
-        response = llm.invoke("Say 'Gemini 2.5 Flash (LangChain) connection successful.'")
-        return f"Gemini (LangChain) Response: {response.content}"
-    except Exception as e:
-        return f"Gemini (LangChain) connection failed: {e}"
-
-# --- Example of how to run the test ---
-if __name__ == "__main__":
-    print("Testing connections...")
-    print(test_gemini_connection())
+    failed_tests = [t for t in test_info.get('test_results', []) if t.get('passed') is False]
+    failure_summary = json.dumps(failed_tests, indent=2)
     
-    # Test Groq
-    print("\nTesting Groq Test Case Generation...")
-    test_code = "int main() { int a, b; scanf(\"%d %d\", &a, &b); printf(\"%d\", a + b); return 0; }"
-    test_cases_result = generate_test_cases_with_logging(test_code)
-    print(f"Status: {test_cases_result['status']}")
-    print(f"Tests: {test_cases_result['tests']}")
+    prompt = PromptTemplate(
+        template="""You are the Test Repair Agent. The student's C code failed ALL initial functional tests. Analyze the failures and, if the existing tests were clearly incorrect (e.g., incorrect expected output for a correct input), generate a *revised* list of up to 5 test cases. If the failures are due to a student code bug, return the original tests and explain the bug in your reasoning.
+        C CODE: {code_text}
+        FAILED TEST SUMMARY: {failure_summary}
+        {format_instructions}
+        """,
+        input_variables=["code_text", "failure_summary"],
+        partial_variables={"format_instructions": parser.get_format_instructions()}
+    )
+
+    chain = prompt | gemini_llm | parser # Using Gemini for deeper reasoning
+    
+    try:
+        result = chain.invoke({"code_text": code_text, "failure_summary": failure_summary})
+        return TestCasesOutput(status="repaired", **result)
+    except Exception as e:
+        logger.error(f"Gemini Test Repair Agent failed: {e}. Cannot repair tests.")
+        return TestCasesOutput(tests=[], reason="Repair agent failed.", status="repair_fail")
+
+
+def CompilationFailureReportAgent(compile_info: Dict[str, Any]) -> FinalReviewOutput:
+    """Agent that generates a specialized report for a critical compilation failure."""
+    parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
+    error_message = compile_info.get("stderr", "No compilation error message provided.")
+    
+    prompt = PromptTemplate(
+        template="""You are a C Programming Tutor. The student's code failed to compile. Generate a detailed feedback report focusing ONLY on the compilation errors. The revised_score must be 0.0, and detailed_feedback must analyze the error messages and provide a concrete fix.
+        COMPILATION ERROR MESSAGE: {error_message}
+        {format_instructions}
+        """,
+        input_variables=["error_message"],
+        partial_variables={"format_instructions": parser.get_format_instructions()}
+    )
+    
+    chain = prompt | gemini_llm | parser
+    
+    try:
+        result = chain.invoke({"error_message": error_message})
+        # Force critical failure results
+        result['revised_score'] = 0.0
+        result['passed_functional_check'] = False
+        return FinalReviewOutput(**result)
+    except Exception as e:
+        return FinalReviewOutput(
+            revised_score=0.0,
+            summary="Agent Failure: Could not generate report for compilation error.",
+            detailed_feedback=f"Could not generate LLM report due to an internal error: {e}.",
+            passed_functional_check=False
+        )
+
+
+def FinalReviewerAgent(full_evaluation_data: Dict[str, Any]) -> FinalReviewOutput:
+    """Agent to generate the final report, review scores, and provide holistic feedback."""
+    parser = JsonOutputParser(pydantic_object=FinalReviewOutput)
+
+    initial_score = full_evaluation_data.get('final_score', 0.0)
+    
+    prompt = PromptTemplate(
+        template="""You are the Final Reviewer Agent. Analyze the complete technical evaluation data for a C program and generate a final, polished report. You may slightly adjust the `initial_score` if the penalties seem overly harsh or lenient.
+        FULL EVALUATION DATA (JSON): {evaluation_data}
+        Initial Calculated Score: {initial_score} / 1.0
+        {format_instructions}
+        """,
+        input_variables=["initial_score"],
+        partial_variables={"format_instructions": parser.get_format_instructions(), 
+                           "evaluation_data": json.dumps(full_evaluation_data, indent=2)}
+    )
+
+    chain = prompt | gemini_llm | parser
+    
+    try:
+        result = chain.invoke({"initial_score": initial_score})
+        # The result includes revised_score, summary, and detailed_feedback
+        return FinalReviewOutput(**result)
+    except Exception as e:
+        test_results = full_evaluation_data.get('test_info', {}).get('test_results', [])
+        return FinalReviewOutput(
+            revised_score=initial_score,
+            summary="Agent Failure: Could not generate report.",
+            detailed_feedback=f"Could not generate LLM report due to an internal error: {e}. Raw data available.",
+            passed_functional_check=all(t.get('passed', False) for t in test_results)
+        )
